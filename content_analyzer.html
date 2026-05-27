@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Content Analyzer — BARC vs Tabsons Comparison Dashboard">
+  <title>Content Analyzer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+
+<body>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+          stroke-linejoin="round">
+          <path
+            d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2v-4M9 21H5a2 2 0 0 1-2-2v-4m0 0h18" />
+          <circle cx="12" cy="12" r="2" fill="currentColor" />
+        </svg>
+      </div>
+      <div>
+        <div class="logo-text">CONTENT ANALYZER</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section">Main</div>
+      <button class="nav-item active" data-view="dashboard" onclick="navigate('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1" />
+          <rect x="14" y="3" width="7" height="7" rx="1" />
+          <rect x="3" y="14" width="7" height="7" rx="1" />
+          <rect x="14" y="14" width="7" height="7" rx="1" />
+        </svg>
+        Dashboard
+      </button>
+
+      <div class="nav-section">Analysis</div>
+      <button class="nav-item" data-view="analysis" onclick="navigate('analysis')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
+          <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
+          <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
+        </svg>
+        Sheet Data
+      </button>
+      <button class="nav-item" data-view="commercial-comparison" onclick="navigate('commercial-comparison')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M16 3h5v5" />
+          <path d="M8 3H3v5" />
+          <path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3" />
+          <path d="m15 9 6-6" />
+        </svg>
+        Commercial Comparison
+      </button>
+
+      <div class="nav-section">Tools</div>
+      <button class="nav-item" data-view="compare-report" onclick="navigate('compare-report')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <line x1="16" y1="13" x2="8" y2="13" />
+          <line x1="16" y1="17" x2="8" y2="17" />
+        </svg>
+        Compare Report
+      </button>
+      <button class="nav-item" data-view="download" onclick="navigate('download')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="7 10 12 15 17 10" />
+          <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>
+        Download Reports
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">CONTENT ANALYZER v4.0</div>
+  </aside>
+
+  <!-- MAIN -->
+  <div class="main">
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <span id="topbar-title" class="topbar-title">Dashboard</span>
+      <div class="global-filters">
+        <div class="filter-group">
+          <label>Channel</label>
+          <select class="filter-select" id="global-channel">
+            <option value="">Select Channel</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label>Date</label>
+          <select class="filter-select" id="global-date">
+            <option value="">Select Date</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- ═══ DASHBOARD ═══ -->
+      <div id="view-dashboard" class="view active">
+        <div class="dash-filters">
+          <div class="dash-filter-group">
+            <label>Source</label>
+            <select class="filter-select" id="dash-source" onchange="loadDashboard()">
+              <option value="TABSONS">TABSONS</option>
+              <option value="BARC XML">BARC XML</option>
+              <option value="TABSONS-BARC" selected>TABSONS-BARC</option>
+            </select>
+          </div>
+          <div class="dash-filter-group">
+            <label>Data Type</label>
+            <select class="filter-select" id="dash-datatype" onchange="loadDashboard()">
+              <option value="COUNT" selected>COUNT</option>
+              <option value="DURATION">DURATION</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="kpi-row" class="kpi-row">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Line Item</div>
+            <div class="kpi-value">—</div>
+            <div class="kpi-sub">Select channel & date</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Commercial</div>
+            <div class="kpi-value">—</div>
+            <div class="kpi-sub">Select channel & date</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Promo</div>
+            <div class="kpi-value">—</div>
+            <div class="kpi-sub">Select channel & date</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">PromoSponsor</div>
+            <div class="kpi-value">—</div>
+            <div class="kpi-sub">Select channel & date</div>
+          </div>
+        </div>
+
+        <div class="chart-container">
+          <div class="chart-title">Distribution Chart</div>
+          <!-- Single chart (TABSONS or BARC XML source) -->
+          <div class="chart-canvas-wrap" id="chart-single">
+            <canvas id="pieChart"></canvas>
+          </div>
+          <!-- Dual charts (TABSONS-BARC source) -->
+          <div class="chart-dual-wrap" id="chart-dual" style="display:none">
+            <div class="chart-dual-item">
+              <div class="chart-dual-label">BARC XML</div>
+              <canvas id="pieChartBarc"></canvas>
+            </div>
+            <div class="chart-dual-item">
+              <div class="chart-dual-label">TABSONS</div>
+              <canvas id="pieChartTabsons"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ ANALYSIS ═══ -->
+      <div id="view-analysis" class="view">
+        <div class="analysis-filters">
+          <div class="dash-filter-group">
+            <label>Sheet</label>
+            <select class="filter-select" id="analysis-sheet" onchange="loadSheetData()" style="min-width:260px">
+              <option value="">Select Sheet</option>
+            </select>
+          </div>
+        </div>
+        <div id="analysis-table-container"></div>
+      </div>
+
+      <!-- ═══ COMMERCIAL COMPARISON ═══ -->
+      <div id="view-commercial-comparison" class="view">
+        <div style="margin-bottom:16px;display:flex;gap:12px;align-items:center">
+          <button class="btn-secondary" onclick="loadCommercialComparison()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="1 4 1 10 7 10" />
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+            </svg>
+            Refresh
+          </button>
+          <span style="color:var(--muted);font-size:12px">Use Remove/Merge buttons to adjust brand matching. Changes are
+            saved to database.</span>
+        </div>
+        <div id="commercial-tables"></div>
+      </div>
+
+      <!-- ═══ COMPARE REPORT ═══ -->
+      <div id="view-compare-report" class="view">
+        <div class="card">
+          <div class="card-title">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <polyline points="14 2 14 8 20 8" />
+            </svg>
+            Compare Report
+          </div>
+          <div class="compare-instructions">
+            <strong>Upload a file containing both BARC and Tabsons source data with 12 required fields present in
+              it.</strong><br>
+            You can download the template from the button below.<br><br>
+            Required fields: source, channel name, TelecastDate, TelecastStartTime, TelecastEndTime, TelecastDuration,
+            BARC ContentType, BARC Title, BARC PromoSponsorName, NCT Program Type, NCT brand, NCT story
+          </div>
+          <div class="upload-zone" id="compare-drop">
+            <input type="file" accept=".xlsx,.xls" id="compare-file-input" onchange="onCompareFileSelect(event)">
+            <div class="upload-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="16 16 12 12 8 16" />
+                <line x1="12" y1="12" x2="12" y2="21" />
+                <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3" />
+              </svg>
+            </div>
+            <div class="upload-title">Drop your Excel file here</div>
+            <div class="upload-hint">or click to browse — .xlsx / .xls</div>
+          </div>
+          <div id="compare-file-info"></div>
+          <div style="margin-top:16px;display:flex;gap:12px">
+            <button class="btn-primary" id="compare-run-btn" style="display:none" onclick="runCompare()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              RUN COMPARISON
+            </button>
+            <button class="btn-secondary" onclick="downloadTemplate()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Download Template
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ DOWNLOAD ═══ -->
+      <div id="view-download" class="view">
+        <div class="download-options">
+          <div class="download-card" onclick="downloadReport('preprocessed')">
+            <div class="dl-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+            </div>
+            <h4>Download Preprocessed Report</h4>
+            <p>Original comparison output as generated by the analysis engine</p>
+          </div>
+          <div class="download-card" onclick="downloadReport('updated')">
+            <div class="dl-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+              </svg>
+            </div>
+            <h4>Download Updated Report</h4>
+            <p>Report with brand modifications applied from Commercial Comparison</p>
+          </div>
+        </div>
+        <div style="margin-top:20px;color:var(--muted);font-size:12px;text-align:center">
+          Select a channel and date from the global filters above to download reports. Format: Excel (.xlsx)
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+
+</html>

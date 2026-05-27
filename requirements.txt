@@ -1,0 +1,9 @@
+flask
+flask-cors
+gunicorn
+pandas
+openpyxl
+pymongo
+dnspython
+python-dotenv
+numpy

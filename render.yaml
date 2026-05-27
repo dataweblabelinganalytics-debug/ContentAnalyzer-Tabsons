@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: content-analyzer
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 1200 --workers 1 --threads 1
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FLASK_ENV
+        value: production
+      - key: DB_NAME
+        value: content_analyzer
+      - key: PORT
+        value: 10000
+      - key: SECRET_KEY
+        generateValue: true
+      - key: MONGO_URI
+        sync: false
