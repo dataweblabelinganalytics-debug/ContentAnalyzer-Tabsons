@@ -4,15 +4,21 @@ const API = '';
 const API_TIMEOUT_MS = 30000;
 const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
 const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
-// Exact workbook fill colors from barc_nct_comparison.py.
-const PROGRAM_TYPE_COLORS = {
-  commercial: '#E2EFDA',
-  promo: '#FFEB9C',
-  promo_sponsor: '#EDE7F6',
+const KPI_STRIP_COLORS = {
+  total: '#93C5FD',
+  commercial: '#FBBF24',
+  promo: '#C4B5FD',
+  promo_sponsor: '#86EFAC',
   program: '#DEEAF1',
 };
+const PROGRAM_TYPE_COLORS = {
+  commercial: KPI_STRIP_COLORS.commercial,
+  promo: KPI_STRIP_COLORS.promo,
+  promo_sponsor: KPI_STRIP_COLORS.promo_sponsor,
+  program: KPI_STRIP_COLORS.program,
+};
 const KPI_DEFS = [
-  { key: 'total', label: 'Total', color: '#2E75B6', textColor: '#2E75B6' },
+  { key: 'total', label: 'Total', color: KPI_STRIP_COLORS.total, textColor: '#2E75B6' },
   { key: 'commercial', label: 'Commercial', color: PROGRAM_TYPE_COLORS.commercial, textColor: '#1F2937' },
   { key: 'promo', label: 'Promo', color: PROGRAM_TYPE_COLORS.promo, textColor: '#1F2937' },
   { key: 'promo_sponsor', label: 'PromoSponsor', color: PROGRAM_TYPE_COLORS.promo_sponsor, textColor: '#1F2937' },
@@ -361,7 +367,7 @@ function renderPieChart(d, source, dataType) {
   if (pieChartTabsons) { pieChartTabsons.destroy(); pieChartTabsons = null; }
 
   // ── Colour palettes ────────────────────────────────────────────────────────
-  // Workbook colors from barc_nct_comparison.py.
+  // KPI top-strip colors drive chart slices and legends.
   const palette1 = getProgramColors();
   const palette2 = getProgramColors();
 
