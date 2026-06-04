@@ -5,11 +5,11 @@ const API_TIMEOUT_MS = 30000;
 const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
 const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
 const KPI_STRIP_COLORS = {
-  total: '#93C5FD',
-  commercial: '#FBBF24',
-  promo: '#C4B5FD',
-  promo_sponsor: '#86EFAC',
-  program: '#DEEAF1',
+  total: '#3B82F6',
+  commercial: '#14B8A6',
+  promo: '#8B5CF6',
+  promo_sponsor: '#F59E0B',
+  program: '#64748B',
 };
 const PROGRAM_TYPE_COLORS = {
   commercial: KPI_STRIP_COLORS.commercial,
@@ -18,7 +18,7 @@ const PROGRAM_TYPE_COLORS = {
   program: KPI_STRIP_COLORS.program,
 };
 const KPI_DEFS = [
-  { key: 'total', label: 'Total', color: KPI_STRIP_COLORS.total, textColor: '#2E75B6' },
+  { key: 'total', label: 'Total', color: KPI_STRIP_COLORS.total, textColor: '#2563EB' },
   { key: 'commercial', label: 'Commercial', color: PROGRAM_TYPE_COLORS.commercial, textColor: '#1F2937' },
   { key: 'promo', label: 'Promo', color: PROGRAM_TYPE_COLORS.promo, textColor: '#1F2937' },
   { key: 'promo_sponsor', label: 'PromoSponsor', color: PROGRAM_TYPE_COLORS.promo_sponsor, textColor: '#1F2937' },
@@ -313,9 +313,8 @@ function renderDashboardKPIs(d, source, dataType) {
   const addVals = (a, b) => isDuration ? formatDuration(parseDurationSeconds(a) + parseDurationSeconds(b)) : parseCountValue(a) + parseCountValue(b);
   const sourcePair = (tabsons, barc) => `
         <span class="kpi-source-pair">
-          <span class="kpi-source-item"><span class="kpi-source-label">TABSONS:</span> ${displayMetric(tabsons)}</span>
-          <span class="kpi-separator">|</span>
-          <span class="kpi-source-item"><span class="kpi-source-label">BARC:</span> ${displayMetric(barc)}</span>
+          <span class="kpi-source-item"><span class="kpi-source-label">TABSONS:</span> <span class="kpi-source-data">${displayMetric(tabsons)}</span></span>
+          <span class="kpi-source-item"><span class="kpi-source-label">BARC:</span> <span class="kpi-source-data">${displayMetric(barc)}</span></span>
         </span>`;
   const card = (def, primary, sub) => `
       <div class="kpi-card" style="--kpi-color:${def.color};--kpi-bg:${hexToRgba(def.color, 0.14)};--kpi-text:${def.textColor}">
