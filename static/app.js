@@ -1,12 +1,105 @@
 // ── Content Analyzer Dashboard — Main JS ────────────────────────────────────
 
 const API = '';
+const API_TIMEOUT_MS = 30000;
+const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
+const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
+const PROGRAM_TYPE_COLORS = {
+  commercial: '#3B82F6',
+  promo: '#F59E0B',
+  promo_sponsor: '#14B8A6',
+  program: '#8B5CF6',
+};
+const KPI_DEFS = [
+  { key: 'total', label: 'Total', color: '#64748B' },
+  { key: 'commercial', label: 'Commercial', color: PROGRAM_TYPE_COLORS.commercial },
+  { key: 'promo', label: 'Promo', color: PROGRAM_TYPE_COLORS.promo },
+  { key: 'promo_sponsor', label: 'PromoSponsor', color: PROGRAM_TYPE_COLORS.promo_sponsor },
+  { key: 'program', label: 'Program', color: PROGRAM_TYPE_COLORS.program },
+];
+
 let currentView = 'dashboard';
 let globalChannel = '';
 let globalDate = '';
 let pieChart = null;
 let pieChartBarc = null;
 let pieChartTabsons = null;
+
+function getSessionState() {
+  try {
+    return JSON.parse(sessionStorage.getItem(SESSION_STATE_KEY) || '{}');
+  } catch (e) {
+    console.warn('Unable to read session state', e);
+    return {};
+  }
+}
+
+function saveSessionState() {
+  try {
+    sessionStorage.setItem(SESSION_STATE_KEY, JSON.stringify({
+      channel: globalChannel,
+      date: globalDate,
+      source: document.getElementById('dash-source')?.value || 'TABSONS-BARC',
+      dataType: document.getElementById('dash-datatype')?.value || 'COUNT',
+      activeView: currentView,
+    }));
+  } catch (e) {
+    console.warn('Unable to save session state', e);
+  }
+}
+
+function getProgramLabels() {
+  return ['Commercial', 'Promo', 'PromoSponsor', 'Program'];
+}
+
+function getProgramColors() {
+  return [
+    PROGRAM_TYPE_COLORS.commercial,
+    PROGRAM_TYPE_COLORS.promo,
+    PROGRAM_TYPE_COLORS.promo_sponsor,
+    PROGRAM_TYPE_COLORS.program,
+  ];
+}
+
+function notify(type, message, error) {
+  if (type === 'error') console.error(message, error || '');
+  if (type === 'warning') console.warn(message, error || '');
+  if (type === 'success') console.log(message);
+
+  let center = document.getElementById('notification-center');
+  if (!center) {
+    center = document.createElement('div');
+    center.id = 'notification-center';
+    center.className = 'notification-center';
+    document.body.appendChild(center);
+  }
+
+  const item = document.createElement('div');
+  item.className = `notice ${type}`;
+  item.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+  const text = document.createElement('div');
+  text.className = 'notice-text';
+  text.textContent = message;
+
+  const close = document.createElement('button');
+  close.className = 'notice-close';
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = 'x';
+  close.onclick = () => item.remove();
+
+  item.append(text, close);
+  center.appendChild(item);
+
+  if (type !== 'error') {
+    setTimeout(() => item.remove(), type === 'success' ? 3500 : 6500);
+  }
+}
+
+function showError(message, error) { notify('error', message, error); }
+function showSuccess(message) { notify('success', message); }
+function showWarning(message, error) { notify('warning', message, error); }
 
 async function readErrorMessage(res) {
   const text = await res.text();
@@ -33,19 +126,61 @@ async function readJsonResponse(res) {
   return data;
 }
 
+async function safeFetch(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+    throw new Error(`Network request failed: ${e.message}`);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function safeApiCall(label, fn, options = {}) {
+  const { loading = false, rethrow = false } = options;
+  if (loading) showLoading(true);
+  try {
+    return await fn();
+  } catch (e) {
+    showError(`${label}: ${e.message}`, e);
+    if (rethrow) throw e;
+    return null;
+  } finally {
+    if (loading) showLoading(false);
+  }
+}
+
 async function fetchJson(url, options) {
-  const res = await fetch(url, options);
+  const res = await safeFetch(url, options);
   return readJsonResponse(res);
 }
 
 async function fetchBlobResponse(url, options) {
-  const res = await fetch(url, options);
+  const res = await safeFetch(url, options);
   if (!res.ok) throw new Error(await readErrorMessage(res));
   return res;
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => { loadChannelDates(); });
+document.addEventListener('DOMContentLoaded', initApp);
+
+async function initApp() {
+  const state = getSessionState();
+  const sourceSel = document.getElementById('dash-source');
+  const dataTypeSel = document.getElementById('dash-datatype');
+
+  if (sourceSel && state.source) sourceSel.value = state.source;
+  if (dataTypeSel && state.dataType) dataTypeSel.value = state.dataType;
+
+  if (sourceSel) sourceSel.onchange = () => { saveSessionState(); loadDashboard(); };
+  if (dataTypeSel) dataTypeSel.onchange = () => { saveSessionState(); loadDashboard(); };
+
+  await loadChannelDates();
+  navigate(state.activeView || 'dashboard');
+}
 
 // ── Navigation ────────────────────────────────────────────────────────────────
 function navigate(view) {
@@ -58,6 +193,7 @@ function navigate(view) {
   if (nav) nav.classList.add('active');
   const titles = { dashboard: 'Dashboard', analysis: 'Sheet Data', 'commercial-comparison': 'Commercial Comparison', 'compare-report': 'Compare Report', download: 'Download Reports' };
   document.getElementById('topbar-title').textContent = titles[view] || 'Dashboard';
+  saveSessionState();
   if (view === 'dashboard') loadDashboard();
   if (view === 'analysis') loadAnalysisSheets();
   if (view === 'commercial-comparison') loadCommercialComparison();
@@ -65,23 +201,43 @@ function navigate(view) {
 
 // ── Global Filters ────────────────────────────────────────────────────────────
 async function loadChannelDates() {
-  try {
+  return safeApiCall('Failed to load channels and dates', async () => {
     const data = await fetchJson(API + '/api/channels-dates');
-    if (data.error) { showToast(data.error, 'error'); return; }
-    if (!Array.isArray(data)) { showToast('Unexpected response from server', 'error'); return; }
+    if (!Array.isArray(data)) throw new Error('Unexpected response from server');
+
     const chSel = document.getElementById('global-channel');
     const dtSel = document.getElementById('global-date');
     const channels = [...new Set(data.map(d => d.channel_name))];
-    chSel.innerHTML = '<option value="">Select Channel</option>' + channels.map(c => `<option value="${c}">${c}</option>`).join('');
-    chSel.onchange = () => {
+    const state = getSessionState();
+
+    chSel.innerHTML = '<option value="">Select Channel</option>' + channels.map(c => `<option value="${escHtml(c)}">${escHtml(c)}</option>`).join('');
+
+    const populateDates = (restore = false) => {
       globalChannel = chSel.value;
       const dates = data.filter(d => d.channel_name === globalChannel).map(d => d.date);
-      dtSel.innerHTML = '<option value="">Select Date</option>' + dates.map(d => `<option value="${d}">${d}</option>`).join('');
-      dtSel.onchange = () => { globalDate = dtSel.value; onGlobalFilterChange(); };
+      dtSel.innerHTML = '<option value="">Select Date</option>' + dates.map(d => `<option value="${escHtml(d)}">${escHtml(d)}</option>`).join('');
+      globalDate = '';
+      if (restore && dates.includes(state.date)) {
+        dtSel.value = state.date;
+        globalDate = state.date;
+      }
     };
-  } catch (e) {
-    showToast('Failed to connect to server: ' + e.message, 'error');
-  }
+
+    if (channels.includes(state.channel)) chSel.value = state.channel;
+    populateDates(true);
+
+    chSel.onchange = () => {
+      populateDates();
+      saveSessionState();
+      onGlobalFilterChange();
+    };
+
+    dtSel.onchange = () => {
+      globalDate = dtSel.value;
+      saveSessionState();
+      onGlobalFilterChange();
+    };
+  });
 }
 
 function onGlobalFilterChange() {
@@ -96,12 +252,12 @@ async function loadDashboard() {
   if (!globalChannel || !globalDate) return;
   const source = document.getElementById('dash-source').value;
   const dataType = document.getElementById('dash-datatype').value;
-  try {
+  saveSessionState();
+  return safeApiCall('Failed to load dashboard', async () => {
     const d = await fetchJson(`${API}/api/dashboard?channel=${encodeURIComponent(globalChannel)}&date=${encodeURIComponent(globalDate)}&source=${encodeURIComponent(source)}&data_type=${encodeURIComponent(dataType)}`);
-    if (d.error) { showToast(d.error, 'error'); return; }
-    renderKPIs(d, source, dataType);
+    renderDashboardKPIs(d, source, dataType);
     renderPieChart(d, source, dataType);
-  } catch (e) { showToast('Failed to load dashboard: ' + e.message, 'error'); }
+  });
 }
 
 function renderKPIs(d, source, dataType) {
@@ -125,19 +281,63 @@ function renderKPIs(d, source, dataType) {
     const totalProgram    = addVals(d.tabsons_program !== undefined ? d.tabsons_program : 0,
                                    d.barc_program    !== undefined ? d.barc_program    : 0);
     container.innerHTML = `
-      <div class="kpi-card"><div class="kpi-label">Total Line Item</div><div class="kpi-value">${totalLineItem}</div><div class="kpi-sub">TABSONS: ${d.tabsons_total} &nbsp;|&nbsp; BARC: ${d.barc_total}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total</div><div class="kpi-value">${totalLineItem}</div><div class="kpi-sub">TABSONS: ${d.tabsons_total} &nbsp;|&nbsp; BARC: ${d.barc_total}</div></div>
       <div class="kpi-card"><div class="kpi-label">Commercial</div><div class="kpi-value">${totalCommercial}</div><div class="kpi-sub">TABSONS: ${d.tabsons_commercial} &nbsp;|&nbsp; BARC: ${d.barc_commercial}</div></div>
       <div class="kpi-card"><div class="kpi-label">Promo</div><div class="kpi-value">${totalPromo}</div><div class="kpi-sub">TABSONS: ${d.tabsons_promo} &nbsp;|&nbsp; BARC: ${d.barc_promo}</div></div>
       <div class="kpi-card"><div class="kpi-label">PromoSponsor</div><div class="kpi-value">${totalPromoSp}</div><div class="kpi-sub">TABSONS: ${d.tabsons_promo_sponsor} &nbsp;|&nbsp; BARC: ${d.barc_promo_sponsor}</div></div>
       <div class="kpi-card kpi-program"><div class="kpi-label">Program</div><div class="kpi-value">${totalProgram}</div><div class="kpi-sub">TABSONS: ${d.tabsons_program !== undefined ? d.tabsons_program : '—'} &nbsp;|&nbsp; BARC: ${d.barc_program !== undefined ? d.barc_program : '—'}</div></div>`;
   } else {
     container.innerHTML = `
-      <div class="kpi-card"><div class="kpi-label">Total Line Item</div><div class="kpi-value">${d.total_line_item}</div><div class="kpi-sub">${dataType}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total</div><div class="kpi-value">${d.total_line_item}</div><div class="kpi-sub">${dataType}</div></div>
       <div class="kpi-card"><div class="kpi-label">Commercial</div><div class="kpi-value">${d.commercial}</div><div class="kpi-sub">${dataType}</div></div>
       <div class="kpi-card"><div class="kpi-label">Promo</div><div class="kpi-value">${d.promo}</div><div class="kpi-sub">${dataType}</div></div>
       <div class="kpi-card"><div class="kpi-label">PromoSponsor</div><div class="kpi-value">${d.promo_sponsor}</div><div class="kpi-sub">${dataType}</div></div>
       <div class="kpi-card kpi-program"><div class="kpi-label">Program</div><div class="kpi-value">${d.program !== undefined ? d.program : '—'}</div><div class="kpi-sub">${dataType}</div></div>`;
   }
+}
+
+function renderDashboardKPIs(d, source, dataType) {
+  const container = document.getElementById('kpi-row');
+  if (!container) return;
+
+  const isDuration = dataType === 'DURATION';
+  const displayMetric = (value) => isDuration ? formatDuration(value) : escHtml(value ?? 0);
+  const addVals = (a, b) => isDuration ? formatDuration(parseNum(a) + parseNum(b)) : parseNum(a) + parseNum(b);
+  const card = (def, primary, sub) => `
+      <div class="kpi-card" style="--kpi-color:${def.color};--kpi-bg:${hexToRgba(def.color, 0.14)}">
+        <div class="kpi-label">${def.label}</div>
+        <div class="kpi-value">${primary}</div>
+        <div class="kpi-sub">${sub}</div>
+      </div>`;
+
+  if (source === 'TABSONS-BARC') {
+    const values = {
+      total: { tabsons: d.tabsons_total, barc: d.barc_total },
+      commercial: { tabsons: d.tabsons_commercial, barc: d.barc_commercial },
+      promo: { tabsons: d.tabsons_promo, barc: d.barc_promo },
+      promo_sponsor: { tabsons: d.tabsons_promo_sponsor, barc: d.barc_promo_sponsor },
+      program: { tabsons: d.tabsons_program ?? 0, barc: d.barc_program ?? 0 },
+    };
+
+    container.innerHTML = KPI_DEFS.map(def => {
+      const v = values[def.key];
+      return card(
+        def,
+        `${displayMetric(v.tabsons)} | ${displayMetric(v.barc)}`,
+        `TOTAL: ${displayMetric(addVals(v.tabsons, v.barc))}`
+      );
+    }).join('');
+    return;
+  }
+
+  const values = {
+    total: d.total_line_item,
+    commercial: d.commercial,
+    promo: d.promo,
+    promo_sponsor: d.promo_sponsor,
+    program: d.program ?? 0,
+  };
+  container.innerHTML = KPI_DEFS.map(def => card(def, displayMetric(values[def.key]), escHtml(dataType))).join('');
 }
 
 function renderPieChart(d, source, dataType) {
@@ -152,13 +352,13 @@ function renderPieChart(d, source, dataType) {
   // ── Colour palettes ────────────────────────────────────────────────────────
   // Palette 1 — Classic Bold  (BARC XML)
   // Commercial → #3B82F6, Promo → #F59E0B, PromoSponsor → #14B8A6, Program → #8B5CF6
-  const palette1 = ['#3B82F6', '#F59E0B', '#14B8A6', '#8B5CF6'];
+  const palette1 = getProgramColors();
   // Palette 2 — Soft Modern   (TABSONS)
-  // Commercial → #10B981, Promo → #F472B6, PromoSponsor → #FBBF24, Program → #6366F1
-  const palette2 = ['#10B981', '#F472B6', '#FBBF24', '#6366F1'];
+  // Commercial → #3B82F6, Promo → #F59E0B, PromoSponsor → #14B8A6, Program → #8B5CF6
+  const palette2 = getProgramColors();
 
   // 4 segments (including Program)
-  const makeLabels = () => ['Commercial', 'Promo', 'PromoSponsor', 'Program'];
+  const makeLabels = getProgramLabels;
 
   const chartOpts = (labels, values, colors) => ({
     type: 'doughnut',
@@ -238,27 +438,56 @@ function parseNum(v) {
   return parseInt(s) || 0;
 }
 
+function formatDuration(value) {
+  const totalSeconds = Math.max(0, Math.floor(parseDurationSeconds(value)));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function parseDurationSeconds(value) {
+  if (typeof value === 'number') return value;
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return 0;
+  if (raw.includes(':')) return parseNum(raw);
+  const n = parseFloat(raw.replace(/[^0-9.]/g, '')) || 0;
+  if (/\b(h|hr|hour|hours)\b/.test(raw)) return n * 3600;
+  if (/\b(m|min|mins|minute|minutes)\b/.test(raw)) return n * 60;
+  return n;
+}
+
+function isDurationColumn(labelOrKey) {
+  return /duration/i.test(String(labelOrKey || ''));
+}
+
+function hexToRgba(hex, alpha) {
+  const clean = String(hex).replace('#', '');
+  const value = parseInt(clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 // ── Analysis ──────────────────────────────────────────────────────────────────
 async function loadAnalysisSheets() {
   if (!globalChannel || !globalDate) return;
-  try {
+  return safeApiCall('Failed to load sheets', async () => {
     const sheets = await fetchJson(`${API}/api/sheets?channel=${encodeURIComponent(globalChannel)}&date=${encodeURIComponent(globalDate)}`);
     const sel = document.getElementById('analysis-sheet');
-    sel.innerHTML = '<option value="">Select Sheet</option>' + sheets.map(s => `<option value="${s.sheet_name}">${s.sheet_name} (${s.row_count} rows)</option>`).join('');
-  } catch (e) { showToast('Failed to load sheets', 'error'); }
+    sel.innerHTML = '<option value="">Select Sheet</option>' + sheets.map(s => `<option value="${escHtml(s.sheet_name)}">${escHtml(s.sheet_name)} (${escHtml(s.row_count)} rows)</option>`).join('');
+  });
 }
 
 async function loadSheetData() {
   const sheet = document.getElementById('analysis-sheet').value;
   if (!sheet || !globalChannel || !globalDate) return;
   if (sheet === 'COMMERCIAL COMPARISION') { navigate('commercial-comparison'); return; }
-  showLoading(true);
-  try {
+  return safeApiCall('Failed to load data', async () => {
     const data = await fetchJson(`${API}/api/sheet-data?channel=${encodeURIComponent(globalChannel)}&date=${encodeURIComponent(globalDate)}&sheet=${encodeURIComponent(sheet)}`);
-    if (data.error) { showToast(data.error, 'error'); return; }
     renderDataTable('analysis-table-container', data.rows, sheet);
-  } catch (e) { showToast('Failed to load data', 'error'); }
-  showLoading(false);
+  }, { loading: true });
 }
 
 function renderDataTable(containerId, rows, title) {
@@ -267,32 +496,29 @@ function renderDataTable(containerId, rows, title) {
   const headerIdx = rows[0].some(h => h && h.length > 0 && h !== 'None') ? 0 : 1;
   const headers = rows[headerIdx];
   const dataRows = rows.slice(headerIdx + 1);
-  let html = `<div class="data-table-wrap"><div class="table-header"><h3>${title}</h3><span style="color:var(--muted);font-size:11px;margin-left:auto">${dataRows.length} rows</span></div><div class="table-scroll"><table class="data-table"><thead><tr>`;
-  headers.forEach(h => { html += `<th>${h||''}</th>`; });
+  const tableKey = makeTableKey(containerId, title);
+  let html = `<div class="data-table-wrap"><div class="table-header"><h3>${escHtml(title)}</h3><span style="color:var(--muted);font-size:11px;margin-left:auto">${dataRows.length} rows</span></div><div class="table-scroll"><table class="data-table" data-table-key="${tableKey}"><thead><tr>`;
+  headers.forEach(h => { html += `<th>${escHtml(h || '')}</th>`; });
   html += '</tr></thead><tbody>';
   dataRows.forEach(row => {
     html += '<tr>';
     row.forEach((cell, idx) => {
-      // Last column gets td-full so remarks/conclusions show completely
-      const cls = (idx === row.length - 1) ? ' class="td-full"' : '';
-      html += `<td${cls} title="${(cell||'').replace(/"/g,'&quot;')}">${cell||''}</td>`;
+      html += renderTableCell(cell, headers[idx], idx === row.length - 1);
     });
     html += '</tr>';
   });
   html += '</tbody></table></div></div>';
   container.innerHTML = html;
+  initResizableTables(container);
 }
 
 // ── Commercial Comparison ─────────────────────────────────────────────────────
 async function loadCommercialComparison() {
   if (!globalChannel || !globalDate) { return; }
-  showLoading(true);
-  try {
+  return safeApiCall('Failed to load commercial data', async () => {
     const data = await fetchJson(`${API}/api/commercial-comparison?channel=${encodeURIComponent(globalChannel)}&date=${encodeURIComponent(globalDate)}`);
-    if (data.error) { showToast(data.error, 'error'); showLoading(false); return; }
     renderCommercialTables(data);
-  } catch (e) { showToast('Failed to load commercial data', 'error'); }
-  showLoading(false);
+  }, { loading: true });
 }
 
 function renderCommercialTables(data) {
@@ -310,7 +536,7 @@ function renderCommercialTables(data) {
     { label: 'Action',          key: null,             cls: 'th-action' },
   ];
 
-  const theadHTML = colDefs.map(c => `<th class="${c.cls}">${c.label}</th>`).join('');
+  const theadHTML = colDefs.map(c => `<th class="${c.cls}">${escHtml(c.label)}</th>`).join('');
 
   // ── helper: build tbody rows ──────────────────────────────────────────────
   const buildRows = (rows, actionFn) => rows.map(r => {
@@ -320,14 +546,14 @@ function renderCommercialTables(data) {
       const display = (v === '—' || v === '\uFFFD' || v === '?') ? '<span style="color:var(--muted)">—</span>' : escHtml(v);
       // Remarks column — show full text, no truncation
       const extraCls = (c.key === 'remarks') ? ' td-full' : '';
-      return `<td class="${extraCls.trim()}" title="${escHtml(v)}">${display}</td>`;
+      return renderTableCell(v, c.label, c.key === 'remarks');
     }).join('');
     return `<tr>${cells}</tr>`;
   }).join('');
 
   // ── Totals ────────────────────────────────────────────────────────────────
   const sumField = (arr, key) => arr.reduce((acc, r) => {
-    const n = parseInt((r[key]||'0').replace(/[^0-9]/g,'')) || 0;
+    const n = isDurationColumn(key) ? parseDurationSeconds(r[key]) : parseInt((r[key]||'0').replace(/[^0-9]/g,'')) || 0;
     return acc + n;
   }, 0);
 
@@ -338,8 +564,8 @@ function renderCommercialTables(data) {
   const totalRow = (arr, label, cssClass) => {
     const bCount = sumField(arr, 'barc_count');
     const nCount = sumField(arr, 'nct_count');
-    const bDur   = sumField(arr, 'barc_duration');
-    const nDur   = sumField(arr, 'nct_duration');
+    const bDur   = formatDuration(sumField(arr, 'barc_duration'));
+    const nDur   = formatDuration(sumField(arr, 'nct_duration'));
     const bUniq  = uniqueBarcBrands(arr);
     const nUniq  = uniqueNctBrands(arr);
     return `<tr class="total-row ${cssClass}">
@@ -358,8 +584,8 @@ function renderCommercialTables(data) {
   const allNctBrands  = new Set([...matched, ...unmatched].map(r => r.nct_brand).filter(b => b && b !== '—')).size;
   const totalBarcCount = sumField(matched, 'barc_count') + sumField(unmatched, 'barc_count');
   const totalNctCount  = sumField(matched, 'nct_count')  + sumField(unmatched, 'nct_count');
-  const totalBarcDur   = sumField(matched, 'barc_duration') + sumField(unmatched, 'barc_duration');
-  const totalNctDur    = sumField(matched, 'nct_duration')  + sumField(unmatched, 'nct_duration');
+  const totalBarcDur   = formatDuration(sumField(matched, 'barc_duration') + sumField(unmatched, 'barc_duration'));
+  const totalNctDur    = formatDuration(sumField(matched, 'nct_duration')  + sumField(unmatched, 'nct_duration'));
   const unmatchedNct   = uniqueNctBrands(unmatched);
 
   // ── Build HTML ────────────────────────────────────────────────────────────
@@ -440,6 +666,119 @@ function renderCommercialTables(data) {
   </div>`;
 
   container.innerHTML = html;
+  initResizableTables(container);
+}
+
+function makeTableKey(...parts) {
+  return parts
+    .map(part => String(part || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
+    .filter(Boolean)
+    .join(':') || 'table';
+}
+
+function renderTableCell(value, header, forceFull = false) {
+  const raw = String(value ?? '');
+  const trimmed = raw.trim();
+  const isMissing = !trimmed || trimmed === '-' || trimmed === '?' || trimmed.includes('\uFFFD');
+  const displayValue = isMissing ? '-' : (isDurationColumn(header) ? formatDuration(raw) : raw);
+  const escaped = escHtml(displayValue);
+  const title = escHtml(isMissing ? '-' : displayValue);
+  const isLong = displayValue.length > 72 || displayValue.includes('\n');
+  const cls = forceFull ? ' class="td-full"' : '';
+
+  if (!isMissing && (isLong || forceFull)) {
+    const preview = escHtml(displayValue.length > 110 ? `${displayValue.slice(0, 110)}...` : displayValue);
+    return `<td${cls} title="${title}"><details class="cell-expand"><summary>${preview}</summary><div>${escaped}</div></details></td>`;
+  }
+
+  if (isMissing) return `<td${cls} title="${title}"><span style="color:var(--muted)">-</span></td>`;
+  return `<td${cls} title="${title}"><span class="cell-text">${escaped}</span></td>`;
+}
+
+function getStoredTableWidths() {
+  try {
+    return JSON.parse(sessionStorage.getItem(TABLE_WIDTHS_KEY) || '{}');
+  } catch (e) {
+    console.warn('Unable to read table widths', e);
+    return {};
+  }
+}
+
+function saveTableWidth(tableKey, colIndex, width) {
+  try {
+    const widths = getStoredTableWidths();
+    widths[tableKey] = widths[tableKey] || {};
+    widths[tableKey][colIndex] = width;
+    sessionStorage.setItem(TABLE_WIDTHS_KEY, JSON.stringify(widths));
+  } catch (e) {
+    console.warn('Unable to save table width', e);
+  }
+}
+
+function ensureColGroup(table, columnCount) {
+  let colgroup = table.querySelector('colgroup');
+  if (!colgroup) {
+    colgroup = document.createElement('colgroup');
+    for (let i = 0; i < columnCount; i++) colgroup.appendChild(document.createElement('col'));
+    table.insertBefore(colgroup, table.firstChild);
+  }
+  return colgroup;
+}
+
+function initResizableTables(root = document) {
+  const tables = root.querySelectorAll('table.data-table');
+  const stored = getStoredTableWidths();
+
+  tables.forEach((table, tableIndex) => {
+    const headers = Array.from(table.querySelectorAll('thead th'));
+    if (!headers.length) return;
+
+    const tableKey = table.dataset.tableKey || makeTableKey(currentView, tableIndex);
+    table.dataset.tableKey = tableKey;
+    const colgroup = ensureColGroup(table, headers.length);
+    const cols = Array.from(colgroup.children);
+
+    headers.forEach((th, colIndex) => {
+      const savedWidth = stored[tableKey]?.[colIndex];
+      if (savedWidth) {
+        cols[colIndex].style.width = `${savedWidth}px`;
+        th.style.width = `${savedWidth}px`;
+      }
+
+      if (!th.querySelector('.col-resizer')) {
+        const handle = document.createElement('span');
+        handle.className = 'col-resizer';
+        handle.setAttribute('aria-hidden', 'true');
+        th.appendChild(handle);
+
+        handle.addEventListener('mousedown', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+
+          const startX = event.clientX;
+          const startWidth = th.getBoundingClientRect().width;
+          table.classList.add('is-resizing');
+
+          const onMove = (moveEvent) => {
+            const nextWidth = Math.max(72, Math.round(startWidth + moveEvent.clientX - startX));
+            cols[colIndex].style.width = `${nextWidth}px`;
+            th.style.width = `${nextWidth}px`;
+          };
+
+          const onUp = () => {
+            const finalWidth = Math.round(th.getBoundingClientRect().width);
+            saveTableWidth(tableKey, colIndex, finalWidth);
+            table.classList.remove('is-resizing');
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          };
+
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+      }
+    });
+  });
 }
 
 function escHtml(s) {
@@ -570,10 +909,10 @@ async function runUpload() {
 function fmtSize(b) { if(b<1024)return b+' B'; if(b<1048576)return(b/1024).toFixed(1)+' KB'; return(b/1048576).toFixed(1)+' MB'; }
 
 function showToast(msg, type='info') {
-  let t = document.getElementById('toast');
-  if (!t) { t=document.createElement('div'); t.id='toast'; t.className='toast'; document.body.appendChild(t); }
-  t.textContent = msg; t.className = 'toast show ' + type;
-  setTimeout(()=>{ t.className='toast'; }, 3500);
+  if (type === 'error') { showError(msg); return; }
+  if (type === 'success') { showSuccess(msg); return; }
+  if (type === 'warning' || type === 'warn') { showWarning(msg); return; }
+  notify('info', msg);
 }
 
 function showLoading(show) {
