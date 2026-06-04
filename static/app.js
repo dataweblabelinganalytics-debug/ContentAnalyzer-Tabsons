@@ -4,18 +4,19 @@ const API = '';
 const API_TIMEOUT_MS = 30000;
 const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
 const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
+// Exact workbook fill colors from barc_nct_comparison.py.
 const PROGRAM_TYPE_COLORS = {
-  commercial: '#3B82F6',
-  promo: '#F59E0B',
-  promo_sponsor: '#14B8A6',
-  program: '#8B5CF6',
+  commercial: '#E2EFDA',
+  promo: '#FFEB9C',
+  promo_sponsor: '#EDE7F6',
+  program: '#DEEAF1',
 };
 const KPI_DEFS = [
-  { key: 'total', label: 'Total', color: '#64748B' },
-  { key: 'commercial', label: 'Commercial', color: PROGRAM_TYPE_COLORS.commercial },
-  { key: 'promo', label: 'Promo', color: PROGRAM_TYPE_COLORS.promo },
-  { key: 'promo_sponsor', label: 'PromoSponsor', color: PROGRAM_TYPE_COLORS.promo_sponsor },
-  { key: 'program', label: 'Program', color: PROGRAM_TYPE_COLORS.program },
+  { key: 'total', label: 'Total', color: '#2E75B6', textColor: '#2E75B6' },
+  { key: 'commercial', label: 'Commercial', color: PROGRAM_TYPE_COLORS.commercial, textColor: '#1F2937' },
+  { key: 'promo', label: 'Promo', color: PROGRAM_TYPE_COLORS.promo, textColor: '#1F2937' },
+  { key: 'promo_sponsor', label: 'PromoSponsor', color: PROGRAM_TYPE_COLORS.promo_sponsor, textColor: '#1F2937' },
+  { key: 'program', label: 'Program', color: PROGRAM_TYPE_COLORS.program, textColor: '#1F2937' },
 ];
 
 let currentView = 'dashboard';
@@ -24,6 +25,7 @@ let globalDate = '';
 let pieChart = null;
 let pieChartBarc = null;
 let pieChartTabsons = null;
+let syncedHoverIndex = null;
 
 function getSessionState() {
   try {
@@ -302,9 +304,15 @@ function renderDashboardKPIs(d, source, dataType) {
 
   const isDuration = dataType === 'DURATION';
   const displayMetric = (value) => isDuration ? formatDuration(value) : escHtml(value ?? 0);
-  const addVals = (a, b) => isDuration ? formatDuration(parseNum(a) + parseNum(b)) : parseNum(a) + parseNum(b);
+  const addVals = (a, b) => isDuration ? formatDuration(parseDurationSeconds(a) + parseDurationSeconds(b)) : parseCountValue(a) + parseCountValue(b);
+  const sourcePair = (tabsons, barc) => `
+        <span class="kpi-source-pair">
+          <span class="kpi-source-item"><span class="kpi-source-label">TABSONS:</span> ${displayMetric(tabsons)}</span>
+          <span class="kpi-separator">|</span>
+          <span class="kpi-source-item"><span class="kpi-source-label">BARC:</span> ${displayMetric(barc)}</span>
+        </span>`;
   const card = (def, primary, sub) => `
-      <div class="kpi-card" style="--kpi-color:${def.color};--kpi-bg:${hexToRgba(def.color, 0.14)}">
+      <div class="kpi-card" style="--kpi-color:${def.color};--kpi-bg:${hexToRgba(def.color, 0.14)};--kpi-text:${def.textColor}">
         <div class="kpi-label">${def.label}</div>
         <div class="kpi-value">${primary}</div>
         <div class="kpi-sub">${sub}</div>
@@ -323,7 +331,7 @@ function renderDashboardKPIs(d, source, dataType) {
       const v = values[def.key];
       return card(
         def,
-        `${displayMetric(v.tabsons)} | ${displayMetric(v.barc)}`,
+        sourcePair(v.tabsons, v.barc),
         `TOTAL: ${displayMetric(addVals(v.tabsons, v.barc))}`
       );
     }).join('');
@@ -343,6 +351,9 @@ function renderDashboardKPIs(d, source, dataType) {
 function renderPieChart(d, source, dataType) {
   const singleWrap = document.getElementById('chart-single');
   const dualWrap   = document.getElementById('chart-dual');
+  const isDuration = dataType === 'DURATION';
+  const chartValue = (value) => isDuration ? parseDurationSeconds(value) : parseCountValue(value);
+  syncedHoverIndex = null;
 
   // Destroy existing charts
   if (pieChart)        { pieChart.destroy();        pieChart = null; }
@@ -350,23 +361,32 @@ function renderPieChart(d, source, dataType) {
   if (pieChartTabsons) { pieChartTabsons.destroy(); pieChartTabsons = null; }
 
   // ── Colour palettes ────────────────────────────────────────────────────────
-  // Palette 1 — Classic Bold  (BARC XML)
-  // Commercial → #3B82F6, Promo → #F59E0B, PromoSponsor → #14B8A6, Program → #8B5CF6
+  // Workbook colors from barc_nct_comparison.py.
   const palette1 = getProgramColors();
-  // Palette 2 — Soft Modern   (TABSONS)
-  // Commercial → #3B82F6, Promo → #F59E0B, PromoSponsor → #14B8A6, Program → #8B5CF6
   const palette2 = getProgramColors();
 
   // 4 segments (including Program)
   const makeLabels = getProgramLabels;
 
-  const chartOpts = (labels, values, colors) => ({
+  const hoverSyncPlugin = {
+    id: 'dashboardHoverSync',
+    afterEvent(chart, args) {
+      if (args.event.type === 'mouseout' && (chart === pieChartBarc || chart === pieChartTabsons)) {
+        syncDualChartHover(null);
+      }
+    }
+  };
+
+  const chartOpts = (labels, values, colors, syncHover = false) => ({
     type: 'doughnut',
     data: {
       labels,
       datasets: [{
         data: values,
         backgroundColor: colors,
+        hoverBackgroundColor: colors,
+        hoverBorderColor: colors,
+        hoverOffset: 8,
         borderColor: 'transparent',
         borderWidth: 0
       }]
@@ -379,8 +399,12 @@ function renderPieChart(d, source, dataType) {
           position: 'bottom',
           labels: { color: '#475569', padding: 14, font: { family: 'DM Sans', size: 11 } }
         }
-      }
-    }
+      },
+      onHover: syncHover ? (event, active) => {
+        syncDualChartHover(active.length ? active[0].index : null);
+      } : undefined
+    },
+    plugins: syncHover ? [hoverSyncPlugin] : []
   });
 
   if (source === 'TABSONS-BARC') {
@@ -391,23 +415,23 @@ function renderPieChart(d, source, dataType) {
     const barcCtx    = document.getElementById('pieChartBarc');
     const tabsonsCtx = document.getElementById('pieChartTabsons');
 
-    // BARC chart — Palette 1
+    // BARC chart
     const barcValues = [
-      parseNum(d.barc_commercial),
-      parseNum(d.barc_promo),
-      parseNum(d.barc_promo_sponsor),
-      parseNum(d.barc_program)
+      chartValue(d.barc_commercial),
+      chartValue(d.barc_promo),
+      chartValue(d.barc_promo_sponsor),
+      chartValue(d.barc_program)
     ];
-    // TABSONS chart — Palette 2
+    // TABSONS chart
     const tabsonsValues = [
-      parseNum(d.tabsons_commercial),
-      parseNum(d.tabsons_promo),
-      parseNum(d.tabsons_promo_sponsor),
-      parseNum(d.tabsons_program)
+      chartValue(d.tabsons_commercial),
+      chartValue(d.tabsons_promo),
+      chartValue(d.tabsons_promo_sponsor),
+      chartValue(d.tabsons_program)
     ];
 
-    if (barcCtx)    pieChartBarc    = new Chart(barcCtx,    chartOpts(makeLabels(), barcValues,    palette1));
-    if (tabsonsCtx) pieChartTabsons = new Chart(tabsonsCtx, chartOpts(makeLabels(), tabsonsValues, palette2));
+    if (barcCtx)    pieChartBarc    = new Chart(barcCtx,    chartOpts(makeLabels(), barcValues,    palette1, true));
+    if (tabsonsCtx) pieChartTabsons = new Chart(tabsonsCtx, chartOpts(makeLabels(), tabsonsValues, palette2, true));
 
   } else {
     // Show single, hide dual
@@ -418,16 +442,38 @@ function renderPieChart(d, source, dataType) {
     if (!ctx) return;
 
     const values = [
-      parseNum(d.commercial),
-      parseNum(d.promo),
-      parseNum(d.promo_sponsor),
-      parseNum(d.program)
+      chartValue(d.commercial),
+      chartValue(d.promo),
+      chartValue(d.promo_sponsor),
+      chartValue(d.program)
     ];
-    // BARC XML → Palette 1 (Classic Bold), TABSONS → Palette 2 (Neon Dark)
     const colors = source === 'BARC XML' ? palette1 : palette2;
 
     pieChart = new Chart(ctx, chartOpts(makeLabels(), values, colors));
   }
+}
+
+function syncDualChartHover(index) {
+  if (syncedHoverIndex === index) return;
+  syncedHoverIndex = index;
+  [pieChartBarc, pieChartTabsons].forEach(chart => setChartHoverIndex(chart, index));
+}
+
+function setChartHoverIndex(chart, index) {
+  if (!chart) return;
+  if (index === null || index === undefined) {
+    chart.setActiveElements([]);
+    chart.tooltip.setActiveElements([], { x: 0, y: 0 });
+    chart.update('none');
+    return;
+  }
+
+  const element = chart.getDatasetMeta(0)?.data?.[index];
+  if (!element) return;
+  const position = element.tooltipPosition();
+  chart.setActiveElements([{ datasetIndex: 0, index }]);
+  chart.tooltip.setActiveElements([{ datasetIndex: 0, index }], position);
+  chart.update('none');
 }
 
 function parseNum(v) {
@@ -436,6 +482,12 @@ function parseNum(v) {
   const s = String(v).replace(/[^0-9:.]/g, '');
   if (s.includes(':')) { const p = s.split(':'); return (parseInt(p[0])||0)*3600+(parseInt(p[1])||0)*60+(parseInt(p[2])||0); }
   return parseInt(s) || 0;
+}
+
+function parseCountValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const n = parseFloat(String(value ?? '').replace(/,/g, '').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
 }
 
 function formatDuration(value) {
@@ -447,11 +499,36 @@ function formatDuration(value) {
 }
 
 function parseDurationSeconds(value) {
-  if (typeof value === 'number') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   const raw = String(value ?? '').trim().toLowerCase();
   if (!raw) return 0;
-  if (raw.includes(':')) return parseNum(raw);
-  const n = parseFloat(raw.replace(/[^0-9.]/g, '')) || 0;
+
+  const dayMatch = raw.match(/(\d+)\s*days?,\s*(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?/);
+  if (dayMatch) {
+    return (parseInt(dayMatch[1], 10) || 0) * 86400
+      + (parseInt(dayMatch[2], 10) || 0) * 3600
+      + (parseInt(dayMatch[3], 10) || 0) * 60
+      + (parseInt(dayMatch[4], 10) || 0);
+  }
+
+  const excelDateMatch = raw.match(/^1900-01-(\d{2})[ t](\d{1,2}):(\d{1,2}):(\d{1,2})/);
+  if (excelDateMatch) {
+    const elapsedDays = Math.max(0, (parseInt(excelDateMatch[1], 10) || 1) - 1);
+    return elapsedDays * 86400
+      + (parseInt(excelDateMatch[2], 10) || 0) * 3600
+      + (parseInt(excelDateMatch[3], 10) || 0) * 60
+      + (parseInt(excelDateMatch[4], 10) || 0);
+  }
+
+  const timeMatches = [...raw.matchAll(/(\d{1,6}):(\d{1,2})(?::(\d{1,2}))?/g)];
+  if (timeMatches.length) {
+    const match = timeMatches[timeMatches.length - 1];
+    return (parseInt(match[1], 10) || 0) * 3600
+      + (parseInt(match[2], 10) || 0) * 60
+      + (parseInt(match[3], 10) || 0);
+  }
+
+  const n = parseFloat(raw.replace(/,/g, '').replace(/[^0-9.]/g, '')) || 0;
   if (/\b(h|hr|hour|hours)\b/.test(raw)) return n * 3600;
   if (/\b(m|min|mins|minute|minutes)\b/.test(raw)) return n * 60;
   return n;

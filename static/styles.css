@@ -106,8 +106,12 @@ body::after{
 .kpi-card.kpi-program::before{background:#FDE68A}
 .kpi-card::before{background:var(--kpi-color,#93C5FD)}
 .kpi-card::after{background:linear-gradient(135deg,var(--kpi-bg,rgba(59,130,246,.14)),rgba(255,255,255,.82));border-color:var(--kpi-bg,rgba(191,219,254,.82))}
-.kpi-card .kpi-value{color:var(--kpi-color,#2563EB)}
+.kpi-card .kpi-value{color:var(--kpi-text,var(--kpi-color,#2563EB))}
 .kpi-sub{max-width:100%;overflow-wrap:anywhere}
+.kpi-source-pair{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;line-height:1.12}
+.kpi-source-item{display:inline-flex;align-items:baseline;gap:5px;min-width:0}
+.kpi-source-label{font-size:.42em;letter-spacing:.08em;font-weight:800;color:#475569;white-space:nowrap}
+.kpi-separator{color:var(--kpi-text,var(--kpi-color,#2563EB));opacity:.78}
 
 /* Source/Data filter row */
 .dash-filters{display:flex;gap:14px;margin-bottom:20px;align-items:center;flex-wrap:wrap}
