@@ -165,9 +165,9 @@ def get_mongo_client() -> MongoClient:
                 appname="content-analyzer",
                 maxPoolSize=int(os.getenv("MONGO_MAX_POOL_SIZE", "50")),
                 minPoolSize=int(os.getenv("MONGO_MIN_POOL_SIZE", "0")),
-                serverSelectionTimeoutMS=int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "60000")),
-                connectTimeoutMS=int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "60000")),
-                socketTimeoutMS=int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "60000")),
+                serverSelectionTimeoutMS=int(os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "120000  ")),
+                connectTimeoutMS=int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "120000")),
+                socketTimeoutMS=int(os.getenv("MONGO_SOCKET_TIMEOUT_MS", "120000 ")),
                 retryWrites=True,
             )
         except InvalidURI as exc:
@@ -492,8 +492,9 @@ def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
         shutil.copy(COMPARISON_SCRIPT, temp_script)
         child_env = os.environ.copy()
         child_env["PYTHONIOENCODING"] = "utf-8"
-        subprocess.run([sys.executable, str(temp_script)], cwd=tmpdir, env=child_env, check=True)
-
+        app.logger.info("Comparison script started")
+        subprocess.run([sys.executable, str(temp_script)], cwd=tmpdir, env=child_env, check=True,timeout=120)
+        app.logger.info("Comparison script completed")
         output_path = Path(tmpdir) / "barc_nct_comparison.xlsx"
         if not output_path.exists():
             raise FileNotFoundError("barc_nct_comparison.xlsx was not generated.")
