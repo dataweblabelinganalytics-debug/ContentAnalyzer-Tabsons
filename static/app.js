@@ -26,6 +26,7 @@ const KPI_DEFS = [
 ];
 
 let currentView = 'dashboard';
+let globalGenre = '';
 let globalChannel = '';
 let globalDate = '';
 let pieChart = null;
@@ -209,35 +210,98 @@ function navigate(view) {
 
 // ── Global Filters ────────────────────────────────────────────────────────────
 async function loadChannelDates() {
-  return safeApiCall('Failed to load channels and dates', async () => {
-    const data = await fetchJson(API + '/api/channels-dates');
-    if (!Array.isArray(data)) throw new Error('Unexpected response from server');
+  return safeApiCall('Failed to load genre hierarchy', async () => {
+    const genres = await fetchJson(API + '/api/genres');
+    if (!Array.isArray(genres)) throw new Error('Unexpected genre response from server');
 
+    const genreSel = document.getElementById('global-genre');
     const chSel = document.getElementById('global-channel');
     const dtSel = document.getElementById('global-date');
-    const channels = [...new Set(data.map(d => d.channel_name))];
     const state = getSessionState();
 
-    chSel.innerHTML = '<option value="">Select Channel</option>' + channels.map(c => `<option value="${escHtml(c)}">${escHtml(c)}</option>`).join('');
+    genreSel.innerHTML = '<option value="">Select Genre</option>' + genres
+      .map(item => item.genre)
+      .map(genre => `<option value="${escHtml(genre)}">${escHtml(genre)}</option>`)
+      .join('');
+    chSel.innerHTML = '<option value="">Select Channel</option>';
+    chSel.disabled = true;
+    dtSel.innerHTML = '<option value="">Select Date</option>';
+    dtSel.disabled = true;
 
-    const populateDates = (restore = false) => {
-      globalChannel = chSel.value;
-      const dates = data.filter(d => d.channel_name === globalChannel).map(d => d.date);
-      dtSel.innerHTML = '<option value="">Select Date</option>' + dates.map(d => `<option value="${escHtml(d)}">${escHtml(d)}</option>`).join('');
+    const populateChannels = async (restoreChannel = '') => {
+      globalGenre = genreSel.value;
+      globalChannel = '';
       globalDate = '';
-      if (restore && dates.includes(state.date)) {
-        dtSel.value = state.date;
-        globalDate = state.date;
+      chSel.innerHTML = '<option value="">Select Channel</option>';
+      dtSel.innerHTML = '<option value="">Select Date</option>';
+      dtSel.disabled = true;
+
+      if (!globalGenre) {
+        chSel.disabled = true;
+        return;
+      }
+
+      const channels = await fetchJson(`${API}/api/channels?genre=${encodeURIComponent(globalGenre)}`);
+      if (!Array.isArray(channels)) throw new Error('Unexpected channel response from server');
+      chSel.innerHTML = '<option value="">Select Channel</option>' + channels
+        .map(item => item.channel_name)
+        .map(channel => `<option value="${escHtml(channel)}">${escHtml(channel)}</option>`)
+        .join('');
+      chSel.disabled = false;
+
+      if (restoreChannel && channels.some(item => item.channel_name === restoreChannel)) {
+        chSel.value = restoreChannel;
+        globalChannel = restoreChannel;
       }
     };
 
-    if (channels.includes(state.channel)) chSel.value = state.channel;
-    populateDates(true);
+    const populateDates = async (restoreDate = '') => {
+      globalChannel = chSel.value;
+      globalDate = '';
+      dtSel.innerHTML = '<option value="">Select Date</option>';
+      dtSel.disabled = true;
 
-    chSel.onchange = () => {
-      populateDates();
-      saveSessionState();
-      onGlobalFilterChange();
+      if (!globalChannel) return;
+
+      const response = await fetchJson(`${API}/api/channel-dates?channel=${encodeURIComponent(globalChannel)}`);
+      const dates = Array.isArray(response.dates) ? response.dates : [];
+      dtSel.innerHTML = '<option value="">Select Date</option>' + dates
+        .map(date => `<option value="${escHtml(date)}">${escHtml(date)}</option>`)
+        .join('');
+      dtSel.disabled = false;
+
+      if (restoreDate && dates.includes(restoreDate)) {
+        dtSel.value = restoreDate;
+        globalDate = restoreDate;
+      }
+    };
+
+    if (state.channel) {
+      try {
+        const details = await fetchJson(`${API}/api/channel-details?channel=${encodeURIComponent(state.channel)}`);
+        if (genres.some(item => item.genre === details.genre)) {
+          genreSel.value = details.genre;
+          await populateChannels(state.channel);
+          await populateDates(state.date);
+        }
+      } catch (e) {
+        console.warn('Unable to restore saved channel hierarchy', e);
+      }
+    }
+
+    genreSel.onchange = async () => {
+      await safeApiCall('Failed to load channels', async () => {
+        await populateChannels();
+        saveSessionState();
+      });
+    };
+
+    chSel.onchange = async () => {
+      await safeApiCall('Failed to load dates', async () => {
+        await populateDates();
+        saveSessionState();
+        onGlobalFilterChange();
+      });
     };
 
     dtSel.onchange = () => {

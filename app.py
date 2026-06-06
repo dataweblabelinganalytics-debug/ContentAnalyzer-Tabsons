@@ -20,7 +20,6 @@ import zipfile
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from barc_nct_comparison import run_comparison as engine_run_comparison
 import pandas as pd
 from bson.decimal128 import Decimal128
 from bson.binary import Binary
@@ -37,6 +36,14 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME") or os.getenv("MONGO_DB_NAME", "content_analyzer")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+SUPPORTED_GENRES = ("NEWS", "GEC / ENTERTAINMENT", "SPORTS", "MUSIC")
+CHANNEL_STATUSES = ("active", "pending_assignment", "inactive")
+CONFIGURED_DEFAULT_CHANNEL_GENRE = os.getenv("DEFAULT_CHANNEL_GENRE", "NEWS").strip().upper()
+DEFAULT_CHANNEL_GENRE = (
+    CONFIGURED_DEFAULT_CHANNEL_GENRE
+    if CONFIGURED_DEFAULT_CHANNEL_GENRE in SUPPORTED_GENRES
+    else "NEWS"
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_FILE = BASE_DIR / "brand_comparison_template.xlsx"
@@ -55,6 +62,7 @@ app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 _mongo_client = None
 _mongo_db = None
 _indexes_ready = False
+_genre_alignment_ready = False
 
 
 def is_api_request() -> bool:
@@ -120,6 +128,28 @@ def api_error(message: str, status: int = 500, **extra):
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def normalize_channel_name(channel_name: str) -> str:
+    return re.sub(r"\s+", " ", str(channel_name or "")).strip()
+
+
+def channel_key(channel_name: str) -> str:
+    return normalize_channel_name(channel_name).upper()
+
+
+def validate_genre(genre: str) -> str:
+    normalized = str(genre or "").strip().upper()
+    if normalized not in SUPPORTED_GENRES:
+        raise ValueError(f"genre must be one of: {', '.join(SUPPORTED_GENRES)}")
+    return normalized
+
+
+def validate_channel_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized not in CHANNEL_STATUSES:
+        raise ValueError(f"status must be one of: {', '.join(CHANNEL_STATUSES)}")
+    return normalized
 
 
 def get_mongo_client() -> MongoClient:
@@ -194,6 +224,16 @@ def ensure_mongo_indexes() -> None:
         [("channel_name", ASCENDING), ("date", ASCENDING), ("timestamp", ASCENDING)],
         name="idx_bm_lookup",
     )
+    database.genre_channel_master.create_index(
+        [("channel_key", ASCENDING)],
+        name="idx_gcm_channel_key",
+        unique=True,
+        partialFilterExpression={"channel_key": {"$type": "string"}},
+    )
+    database.genre_channel_master.create_index(
+        [("genre", ASCENDING), ("status", ASCENDING), ("channel_name", ASCENDING)],
+        name="idx_gcm_genre_channels",
+    )
     _indexes_ready = True
     app.logger.info("MongoDB indexes are ready")
 
@@ -206,6 +246,130 @@ def get_collections():
         database.sheets,
         database.brand_modifications,
     )
+
+
+def get_channel_master_collection():
+    ensure_mongo_indexes()
+    return get_mongo_database().genre_channel_master
+
+
+def ensure_channel_record(
+    channel_name: str,
+    genre: str = None,
+    status: str = None,
+):
+    """Return a valid master record, creating a pending assignment when needed."""
+    normalized_name = normalize_channel_name(channel_name)
+    normalized_key = channel_key(normalized_name)
+    if not normalized_key:
+        raise ValueError("channel_name is required")
+
+    master = get_channel_master_collection()
+    existing = master.find_one({"channel_key": normalized_key})
+    if not existing:
+        existing = master.find_one({"channel_name": normalized_name})
+    now = utc_now_iso()
+
+    if existing:
+        updates = {}
+        existing_genre = existing.get("genre")
+        existing_status = existing.get("status")
+
+        if genre is not None:
+            updates["genre"] = validate_genre(genre)
+        elif existing_genre not in SUPPORTED_GENRES:
+            updates["genre"] = DEFAULT_CHANNEL_GENRE
+
+        if status is not None:
+            updates["status"] = validate_channel_status(status)
+        elif existing_status not in CHANNEL_STATUSES:
+            updates["status"] = "pending_assignment"
+
+        if not existing.get("channel_name"):
+            updates["channel_name"] = normalized_name
+        if not existing.get("created_at"):
+            updates["created_at"] = now
+        if not existing.get("updated_at"):
+            updates["updated_at"] = now
+        if not existing.get("channel_key"):
+            updates["channel_key"] = normalized_key
+
+        if updates:
+            if set(updates) != {"updated_at"}:
+                updates["updated_at"] = now
+            master.update_one({"_id": existing["_id"]}, {"$set": updates})
+            existing.update(updates)
+        return existing
+
+    assigned_genre = validate_genre(genre or DEFAULT_CHANNEL_GENRE)
+    assigned_status = validate_channel_status(status or "pending_assignment")
+    document = {
+        "channel_key": normalized_key,
+        "channel_name": normalized_name,
+        "genre": assigned_genre,
+        "status": assigned_status,
+        "created_at": now,
+        "updated_at": now,
+    }
+    master.update_one(
+        {"channel_key": normalized_key},
+        {"$setOnInsert": document},
+        upsert=True,
+    )
+    return master.find_one({"channel_key": normalized_key})
+
+
+def migrate_genre_hierarchy(force: bool = False):
+    """Align legacy channel documents with the genre/channel master collection."""
+    global _genre_alignment_ready
+    if _genre_alignment_ready and not force:
+        return {"channels": 0, "processed_files": 0, "sheets": 0, "already_aligned": True}
+
+    processed_files, sheets, _ = get_collections()
+    channel_names = [
+        name for name in processed_files.distinct("channel_name")
+        if normalize_channel_name(name)
+    ]
+    migrated_files = 0
+    migrated_sheets = 0
+
+    for name in channel_names:
+        record = ensure_channel_record(name)
+        genre = record["genre"]
+        migrated_files += processed_files.update_many(
+            {"channel_name": name, "genre": {"$ne": genre}},
+            {"$set": {"genre": genre}},
+        ).modified_count
+        migrated_sheets += sheets.update_many(
+            {"channel_name": name, "genre": {"$ne": genre}},
+            {"$set": {"genre": genre}},
+        ).modified_count
+
+    _genre_alignment_ready = True
+    result = {
+        "channels": len(channel_names),
+        "processed_files": migrated_files,
+        "sheets": migrated_sheets,
+        "already_aligned": False,
+    }
+    app.logger.info("Genre hierarchy migration complete: %s", result)
+    return result
+
+
+def update_channel_assignment(channel_name: str, genre: str, status: str = "active"):
+    """Assign a validated genre and synchronize existing report documents."""
+    record = ensure_channel_record(channel_name, genre=genre, status=status)
+    processed_files, sheets, _ = get_collections()
+    canonical_name = record["channel_name"]
+    processed_files.update_many(
+        {"channel_name": canonical_name},
+        {"$set": {"genre": record["genre"]}},
+    )
+    sheets.update_many(
+        {"channel_name": canonical_name},
+        {"$set": {"genre": record["genre"]}},
+    )
+    return record
 
 
 def database_error_response(exc):
@@ -339,7 +503,13 @@ def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
     return xlsx_bytes, output_filename, stats
 
 
-def parse_workbook_sheets(xlsx_bytes: bytes, file_id: str, channel_name: str, date_str: str):
+def parse_workbook_sheets(
+    xlsx_bytes: bytes,
+    file_id: str,
+    channel_name: str,
+    date_str: str,
+    genre: str,
+):
     uploaded_at = utc_now_iso()
     sheet_documents = []
     xls = pd.ExcelFile(io.BytesIO(xlsx_bytes))
@@ -355,6 +525,7 @@ def parse_workbook_sheets(xlsx_bytes: bytes, file_id: str, channel_name: str, da
             {
                 "file_id": file_id,
                 "channel_name": channel_name,
+                "genre": genre,
                 "date": date_str,
                 "sheet_name": sheet_name,
                 "headers": headers,
@@ -371,13 +542,23 @@ def parse_workbook_sheets(xlsx_bytes: bytes, file_id: str, channel_name: str, da
 def upload_to_db(xlsx_bytes: bytes, channel_name: str, date_str: str, original_filename: str):
     """Parse the processed Excel workbook and store it in MongoDB."""
     processed_files, sheets, _ = get_collections()
+    channel_record = ensure_channel_record(channel_name)
+    channel_name = channel_record["channel_name"]
+    genre = channel_record["genre"]
     file_id = str(uuid.uuid4())
     uploaded_at = utc_now_iso()
-    sheet_documents = parse_workbook_sheets(xlsx_bytes, file_id, channel_name, date_str)
+    sheet_documents = parse_workbook_sheets(
+        xlsx_bytes,
+        file_id,
+        channel_name,
+        date_str,
+        genre,
+    )
 
     file_document = {
         "file_id": file_id,
         "channel_name": channel_name,
+        "genre": genre,
         "date": date_str,
         "original_filename": original_filename,
         "xlsx_data": Binary(xlsx_bytes),
@@ -431,21 +612,155 @@ def healthz():
     return json_response({"status": "ok"})
 
 
+@app.route("/api/genres", methods=["GET"])
+def get_genres():
+    """Return the complete supported genre hierarchy."""
+    try:
+        migrate_genre_hierarchy()
+        master = get_channel_master_collection()
+        counts = {
+            row["_id"]: row["count"]
+            for row in master.aggregate(
+                [
+                    {"$match": {"status": {"$ne": "inactive"}}},
+                    {"$group": {"_id": "$genre", "count": {"$sum": 1}}},
+                ]
+            )
+            if row.get("_id") in SUPPORTED_GENRES
+        }
+        return json_response(
+            [{"genre": genre, "channel_count": counts.get(genre, 0)} for genre in SUPPORTED_GENRES]
+        )
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+
+@app.route("/api/channels", methods=["GET"])
+def get_channels_by_genre():
+    """Return master channels belonging to one validated genre."""
+    try:
+        genre = validate_genre(request.args.get("genre", ""))
+        migrate_genre_hierarchy()
+        master = get_channel_master_collection()
+        docs = master.find(
+            {"genre": genre, "status": {"$ne": "inactive"}},
+            {
+                "_id": 0,
+                "channel_name": 1,
+                "genre": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+        ).sort("channel_name", ASCENDING)
+        return json_response(list(docs))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+
+@app.route("/api/channel-details", methods=["GET", "PUT"])
+def channel_details():
+    """Get or update one channel master record."""
+    try:
+        migrate_genre_hierarchy()
+        master = get_channel_master_collection()
+
+        if request.method == "GET":
+            name = request.args.get("channel", "")
+            key = channel_key(name)
+            if not key:
+                return api_error("channel required", 400)
+            record = master.find_one(
+                {"channel_key": key},
+                {
+                    "_id": 0,
+                    "channel_key": 0,
+                },
+            )
+            if not record:
+                return api_error("Channel not found", 404)
+            return json_response(record)
+
+        data = request.get_json(silent=True) or {}
+        name = data.get("channel_name", "")
+        genre = data.get("genre", "")
+        status = data.get("status", "active")
+        record = update_channel_assignment(name, genre, status)
+        return json_response(
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"_id", "channel_key"}
+            }
+        )
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+
+@app.route("/api/channel-dates", methods=["GET"])
+def get_channel_dates():
+    """Return available report dates for one master channel."""
+    channel = normalize_channel_name(request.args.get("channel", ""))
+    if not channel:
+        return api_error("channel required", 400)
+
+    try:
+        migrate_genre_hierarchy()
+        master = get_channel_master_collection()
+        record = master.find_one({"channel_key": channel_key(channel)})
+        if not record or record.get("status") == "inactive":
+            return api_error("Channel not found", 404)
+
+        processed_files, _, _ = get_collections()
+        dates = processed_files.distinct("date", {"channel_name": record["channel_name"]})
+        return json_response(
+            {
+                "channel_name": record["channel_name"],
+                "genre": record["genre"],
+                "dates": sorted(date for date in dates if date),
+            }
+        )
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+
 @app.route("/api/channels-dates", methods=["GET"])
 def get_channels_dates():
     """Return distinct channel/date combinations from MongoDB."""
     try:
+        migrate_genre_hierarchy()
         processed_files, _, _ = get_collections()
+        master = get_channel_master_collection()
+        channel_records = {
+            row["channel_key"]: row
+            for row in master.find(
+                {"status": {"$ne": "inactive"}},
+                {"_id": 0, "channel_key": 1, "genre": 1, "status": 1},
+            )
+        }
         docs = processed_files.find(
             {},
             {"_id": 0, "channel_name": 1, "date": 1},
         ).sort([("channel_name", ASCENDING), ("date", ASCENDING)])
-        return json_response(
-            [
-                {"channel_name": doc.get("channel_name", ""), "date": doc.get("date", "")}
-                for doc in docs
-            ]
-        )
+        result = []
+        for doc in docs:
+            name = doc.get("channel_name", "")
+            record = channel_records.get(channel_key(name))
+            if not record:
+                continue
+            result.append(
+                {
+                    "channel_name": name,
+                    "date": doc.get("date", ""),
+                    "genre": record["genre"],
+                    "status": record["status"],
+                }
+            )
+        return json_response(result)
     except (PyMongoError, RuntimeError) as exc:
         return database_error_response(exc)
 
@@ -1020,12 +1335,19 @@ def run_startup_diagnostics() -> None:
     if os.getenv("MONGO_DB_NAME") and not os.getenv("DB_NAME"):
         app.logger.warning("MONGO_DB_NAME is deprecated. Set DB_NAME on Render and locally.")
 
+    if CONFIGURED_DEFAULT_CHANNEL_GENRE not in SUPPORTED_GENRES:
+        app.logger.warning(
+            "Invalid DEFAULT_CHANNEL_GENRE=%s; using NEWS",
+            CONFIGURED_DEFAULT_CHANNEL_GENRE,
+        )
+
     if not MONGO_URI:
         app.logger.warning("MONGO_URI is not set. Database routes require MongoDB Atlas.")
         return
 
     try:
         ensure_mongo_indexes()
+        migrate_genre_hierarchy()
     except Exception as exc:
         app.logger.warning("MongoDB startup validation/index initialization deferred: %s", exc)
 
