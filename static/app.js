@@ -2,6 +2,7 @@
 
 const API = '';
 const API_TIMEOUT_MS = 30000;
+const COMPARE_TIMEOUT_MS = 120000;
 const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
 const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
 const KPI_STRIP_COLORS = {
@@ -167,8 +168,8 @@ async function fetchJson(url, options) {
   return readJsonResponse(res);
 }
 
-async function fetchBlobResponse(url, options) {
-  const res = await safeFetch(url, options);
+async function fetchBlobResponse(url, options, timeoutMs = API_TIMEOUT_MS) {
+  const res = await safeFetch(url, options, timeoutMs);
   if (!res.ok) throw new Error(await readErrorMessage(res));
   return res;
 }
@@ -981,7 +982,11 @@ async function runCompare() {
   try {
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetchBlobResponse(API+'/api/compare',{method:'POST',body:fd});
+    const res = await fetchBlobResponse(
+      API+'/api/compare',
+      {method:'POST',body:fd},
+      COMPARE_TIMEOUT_MS
+    );
     const blob = await res.blob();
     let filename = 'comparison_result.xlsx';
     const disp = res.headers.get('Content-Disposition');

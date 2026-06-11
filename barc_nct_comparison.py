@@ -31,13 +31,44 @@ Sheets:
   4. DETAILED ANALYSIS
 """
 
+import os
 import re
+import sys
+import time
+from bisect import bisect_left
 from datetime import timedelta
 from difflib import SequenceMatcher
+from functools import lru_cache
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+SCRIPT_STARTED = time.perf_counter()
+
+
+def peak_rss_mib():
+    """Return peak resident memory where the platform exposes it."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            peak /= 1024
+        return round(peak / 1024, 2)
+    except (ImportError, AttributeError, OSError):
+        return None
+
+
+def log_timing(stage, started, **details):
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    fields = [f"stage={stage}", f"duration_ms={elapsed_ms:.1f}"]
+    fields.extend(f"{key}={value}" for key, value in details.items())
+    peak = peak_rss_mib()
+    if peak is not None:
+        fields.append(f"peak_rss_mib={peak}")
+    print("[Timing] " + " ".join(fields), flush=True)
+    return elapsed_ms
 
 # ── Configurable ──────────────────────────────────────────────────────────────
 INPUT_FILE           = "brand_comparison_template.xlsx"
@@ -82,11 +113,13 @@ def normalise_type(val: str) -> str:
     v = val.strip().upper()
     return "PROGRAM" if v == "STORY BLOCK" else v
 
+@lru_cache(maxsize=65536)
 def normalise_for_match(s: str) -> str:
     s = s.upper().strip()
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+@lru_cache(maxsize=65536)
 def smart_match(brand: str, nct_val: str) -> float:
     a = normalise_for_match(brand)
     b = normalise_for_match(nct_val)
@@ -123,8 +156,25 @@ def find_brand_in_nct(brand: str, nct_rows: pd.DataFrame, threshold: float):
         return best_idx, best_score, best_field
     return None, best_score, None
 
+@lru_cache(maxsize=65536)
 def normalise_name(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", s.upper().strip())
+
+
+def build_time_index(rows: pd.DataFrame):
+    """Build a sorted start-time index while preserving original row positions."""
+    pairs = sorted(
+        (hms_to_secs(value), int(idx))
+        for idx, value in rows["TelecastStartTime"].items()
+    )
+    return [pair[0] for pair in pairs], [pair[1] for pair in pairs]
+
+
+def select_time_window(rows, start_times, positions, start, end):
+    left = bisect_left(start_times, start)
+    right = bisect_left(start_times, end)
+    selected = sorted(positions[left:right])
+    return rows.loc[selected]
 
 def best_match_in_list(query: str, candidates: list, threshold: float):
     norm_q = normalise_name(query)
@@ -151,6 +201,7 @@ SEC_FILL   = PatternFill("solid", fgColor="BDD7EE")
 BARC_FILL  = PatternFill("solid", fgColor="DEEAF1")
 NCT_FILL   = PatternFill("solid", fgColor="E2EFDA")
 PS_FILL    = PatternFill("solid", fgColor="EDE7F6")   # soft purple for PS column
+PS_HDR_FILL = PatternFill("solid", fgColor="4A148C")
 CONC_FILL  = PatternFill("solid", fgColor="FFF2CC")
 MATCH_FILL = PatternFill("solid", fgColor="E2EFDA")
 MISS_FILL  = PatternFill("solid", fgColor="FFC7CE")
@@ -169,13 +220,29 @@ THIN        = Side(style="thin",   color="BFBFBF")
 MED         = Side(style="medium", color="595959")
 THIN_BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 MED_BORDER  = Border(left=MED,  right=MED,  top=MED,  bottom=MED)
+NO_FILL     = PatternFill()
+_STYLE_CACHE = {}
 
 def sc(ws, row, col, val, font=None, fill=None, align=CENTER, border=THIN_BORDER):
     c = ws.cell(row=row, column=col, value=val)
-    c.font      = font   or NORMAL_FONT
-    c.fill      = fill   or PatternFill()
-    c.alignment = align
-    c.border    = border
+    selected_font = font or NORMAL_FONT
+    selected_fill = fill or NO_FILL
+    cache_key = (
+        id(ws.parent),
+        id(selected_font),
+        id(selected_fill),
+        id(align),
+        id(border),
+    )
+    cached_style = _STYLE_CACHE.get(cache_key)
+    if cached_style is None:
+        c.font = selected_font
+        c.fill = selected_fill
+        c.alignment = align
+        c.border = border
+        _STYLE_CACHE[cache_key] = c._style
+    else:
+        c._style = cached_style
     return c
 
 def hdr(ws, row, col, val, fill=HDR_FILL):
@@ -214,6 +281,7 @@ def compare_rows(df_barc, df_nct, threshold, tol):
     """
     nct = df_nct.copy().reset_index(drop=True)
     nct["_ss"] = nct["TelecastStartTime"].apply(hms_to_secs)
+    start_times, positions = build_time_index(nct)
 
     barc_dur_pm, barc_remarks = [], []
     ps_matched_nct  = set()            # NCT positional indices claimed as PS
@@ -228,8 +296,13 @@ def compare_rows(df_barc, df_nct, threshold, tol):
         b_title  = safe_str(brow["BARC Title"])
         b_spname = safe_str(brow["BARC PromoSponsorName"])
 
-        mask    = (nct["_ss"] >= (b_start - tol)) & (nct["_ss"] < (b_end + tol))
-        nct_win = nct[mask].copy()
+        nct_win = select_time_window(
+            nct,
+            start_times,
+            positions,
+            b_start - tol,
+            b_end + tol,
+        )
 
         nct_types = nct_win["NCT Program Type"].apply(
                         lambda v: normalise_type(safe_str(v))).unique().tolist()
@@ -377,21 +450,17 @@ def build_comparison_sheet(ws, df_orig, barc_dur_pm, barc_remarks, nct_ps_label)
 
     # Header row
     for col_i, h in enumerate(all_cols, 1):
-        cell = hdr(ws, 2, col_i, h)
-        if h == "NCT PromoSponsor":
-            cell.fill = PatternFill("solid", fgColor="4A148C")   # dark purple header
+        hdr(ws, 2, col_i, h, fill=PS_HDR_FILL if h == "NCT PromoSponsor" else HDR_FILL)
 
     # ── Build a lookup: positional-index-in-NCT-subset → PS label ────────────
     # nct_ps_label keys are positional indices within df_nct (reset_index).
     # We need to map those back to absolute row positions in df_orig.
-    nct_positions = df[df["source"].apply(safe_str).str.upper() == "NCT"].index.tolist()
-    # nct_positions[i] = absolute iloc in df_orig for the i-th NCT row
-
     barc_ptr = 0
     nct_ptr  = 0
+    source_col = orig_cols.index("source")
 
-    for row_i, (_, orig_row) in enumerate(df.iterrows(), 3):
-        src = safe_str(orig_row.get("source", "")).upper()
+    for row_i, values in enumerate(df.itertuples(index=False, name=None), 3):
+        src = safe_str(values[source_col]).upper()
 
         if src == "BARC XML":
             dur_pm = barc_dur_pm[barc_ptr] if barc_ptr < len(barc_dur_pm) else ""
@@ -416,8 +485,7 @@ def build_comparison_sheet(ws, df_orig, barc_dur_pm, barc_remarks, nct_ps_label)
             row_fill = PS_FILL if ps_col else None
 
         # Write original columns
-        for col_i, col_name in enumerate(orig_cols, 1):
-            val = safe_str(df.at[orig_row.name, col_name]) if col_name in df.columns else ""
+        for col_i, val in enumerate(values, 1):
             sc(ws, row_i, col_i, val, fill=row_fill,
                align=LEFT if col_i > 3 else CENTER)
 
@@ -776,9 +844,7 @@ def build_commercial_sheet(ws, df_barc, df_nct, threshold, ps_matched_nct,
     c.font = TITLE_FONT; c.fill = TITLE_FILL; c.alignment = CENTER
 
     for ci, h in enumerate(headers, 1):
-        cell = hdr(ws, 2, ci, h)
-        if "PS" in h:
-            cell.fill = PatternFill("solid", fgColor="4A148C")
+        hdr(ws, 2, ci, h, fill=PS_HDR_FILL if "PS" in h else HDR_FILL)
 
     cur = 3
     merge_title(ws, cur, 1, COLS, "BARC COMMERCIAL vs NCT COMMERCIAL — MATCHED", TITLE_FILL)
@@ -1198,6 +1264,7 @@ def build_detailed_analysis_sheet(ws, df_barc, df_nct, threshold, tol):
     nct = df_nct.copy().reset_index(drop=True)
     nct["_ss"] = nct["TelecastStartTime"].apply(hms_to_secs)
     nct["_se"] = nct["TelecastEndTime"].apply(hms_to_secs)
+    start_times, positions = build_time_index(nct)
 
     COLS = 9
     headers = ["BARC CONTENT NAME","BARC CONTENT TYPE","BARC START TIME","BARC END TIME",
@@ -1223,8 +1290,13 @@ def build_detailed_analysis_sheet(ws, df_barc, df_nct, threshold, tol):
         if b_ctype not in ("COMMERCIAL", "PROMO"): continue
 
         is_sp   = (b_ctype == "PROMO" and b_title.lower().startswith("sponsorship promo"))
-        mask    = (nct["_ss"] >= (b_start - tol)) & (nct["_ss"] < (b_end + tol))
-        nct_win = nct[mask].copy()
+        nct_win = select_time_window(
+            nct,
+            start_times,
+            positions,
+            b_start - tol,
+            b_end + tol,
+        )
         if len(nct_win) == 0: continue
 
         if is_sp and b_spname:
@@ -1290,7 +1362,17 @@ def build_detailed_analysis_sheet(ws, df_barc, df_nct, threshold, tol):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 print(f"Reading: {INPUT_FILE}")
-df = pd.read_excel(INPUT_FILE, dtype=str)
+read_started = time.perf_counter()
+xls = pd.ExcelFile(INPUT_FILE)
+df = pd.read_excel(xls, dtype=str)
+log_timing(
+    "workbook_read",
+    read_started,
+    input_bytes=os.path.getsize(INPUT_FILE),
+    sheet_count=len(xls.sheet_names),
+    rows=len(df),
+    columns=len(df.columns),
+)
 df.columns = [c.strip() for c in df.columns]
 
 for col in ["source","channel name","TelecastDate","TelecastStartTime",
@@ -1307,12 +1389,26 @@ df_nct  = df[df["source"] == "NCT"].copy().reset_index(drop=True)
 
 print(f"  BARC rows : {len(df_barc)}")
 print(f"  NCT rows  : {len(df_nct)}")
+print(
+    "[Memory] "
+    f"dataframe_mib={df.memory_usage(index=True, deep=True).sum() / 1024 / 1024:.2f} "
+    f"barc_dataframe_mib={df_barc.memory_usage(index=True, deep=True).sum() / 1024 / 1024:.2f} "
+    f"nct_dataframe_mib={df_nct.memory_usage(index=True, deep=True).sum() / 1024 / 1024:.2f}",
+    flush=True,
+)
 
+comparison_started = time.perf_counter()
 barc_dur_pm, barc_remarks, ps_matched_nct, nct_ps_label, ps_brand_nct_map = compare_rows(
     df_barc, df_nct, SIMILARITY_THRESHOLD, TIME_TOLERANCE_SECS)
 
 barc_brands, brand_matches = analyse_brands(
     df_barc, ps_brand_nct_map, SIMILARITY_THRESHOLD)
+log_timing(
+    "comparison_engine",
+    comparison_started,
+    barc_rows=len(df_barc),
+    nct_rows=len(df_nct),
+)
 
 ok_count = sum(1 for r in barc_remarks if r == "OK")
 print(f"  Results   : {len(barc_remarks)} BARC rows → {ok_count} OK, "
@@ -1324,33 +1420,56 @@ for b, v in sorted(ps_brand_nct_map.items()):
     print(f"    {b}: count={v['count']}  secs={v['secs']}")
 print(f"  Brands matched : {sum(1 for m in brand_matches if m['matched'])}/{len(barc_brands)}")
 def run_comparison():
+    generation_started = time.perf_counter()
     wb = Workbook()
     wb.remove(wb.active)
 
     ws1 = wb.create_sheet("COMPARISON")
+    stage_started = time.perf_counter()
     build_comparison_sheet(ws1, df, barc_dur_pm, barc_remarks, nct_ps_label)
+    log_timing("sheet_comparison", stage_started, rows=ws1.max_row, columns=ws1.max_column)
 
     ws2 = wb.create_sheet("SUMMARY")
+    stage_started = time.perf_counter()
     build_summary_sheet(ws2, df_barc, df_nct, brand_matches,
                         barc_brands, ps_brand_nct_map, ps_matched_nct, SIMILARITY_THRESHOLD)
+    log_timing("sheet_summary", stage_started, rows=ws2.max_row, columns=ws2.max_column)
 
     ws3 = wb.create_sheet("COMMERCIAL COMPARISION")
+    stage_started = time.perf_counter()
     build_commercial_sheet(ws3, df_barc, df_nct, SIMILARITY_THRESHOLD,
                         ps_matched_nct, ps_brand_nct_map)
+    log_timing("sheet_commercial", stage_started, rows=ws3.max_row, columns=ws3.max_column)
 
     ws5 = wb.create_sheet("TABSONS SUMMARY")
+    stage_started = time.perf_counter()
     build_tabsons_summary_sheet(ws5, df_barc, df_nct,
                                 barc_brands, ps_brand_nct_map, ps_matched_nct)
+    log_timing("sheet_tabsons_summary", stage_started, rows=ws5.max_row, columns=ws5.max_column)
 
     ws4 = wb.create_sheet("DETAILED ANALYSIS")
+    stage_started = time.perf_counter()
     da_rows = build_detailed_analysis_sheet(ws4, df_barc, df_nct,
                                             SIMILARITY_THRESHOLD, TIME_TOLERANCE_SECS)
+    log_timing("sheet_detailed_analysis", stage_started, rows=ws4.max_row, columns=ws4.max_column)
 
+    stage_started = time.perf_counter()
     add_commercial_summary_to_summary(ws2, df_barc, df_nct, ps_matched_nct)
+    log_timing("sheet_commercial_summary", stage_started)
 
+    save_started = time.perf_counter()
     wb.save(OUTPUT_FILE)
+    log_timing(
+        "workbook_save",
+        save_started,
+        output_bytes=os.path.getsize(OUTPUT_FILE),
+        sheet_count=len(wb.sheetnames),
+        workbook_cells=sum(ws.max_row * ws.max_column for ws in wb.worksheets),
+    )
+    log_timing("workbook_generation_total", generation_started)
     print(f"\nOutput saved: {OUTPUT_FILE}")
     print(f"  DETAILED ANALYSIS rows written: {da_rows}")
+    log_timing("processor_total", SCRIPT_STARTED)
 
 if __name__ == "__main__":
     run_comparison()

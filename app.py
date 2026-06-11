@@ -21,12 +21,14 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 import pandas as pd
+from bson import BSON
 from bson.decimal128 import Decimal128
 from bson.binary import Binary
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from openpyxl import load_workbook
 from werkzeug.exceptions import HTTPException
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import InvalidURI, PyMongoError
@@ -63,6 +65,37 @@ _mongo_client = None
 _mongo_db = None
 _indexes_ready = False
 _genre_alignment_ready = False
+
+
+def peak_rss_mib():
+    """Return peak resident memory where the platform exposes it."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            peak /= 1024
+        return round(peak / 1024, 2)
+    except (ImportError, AttributeError, OSError):
+        return None
+
+
+def log_stage(request_id: str, stage: str, started: float, **details) -> float:
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    fields = {
+        "request_id": request_id,
+        "stage": stage,
+        "duration_ms": round(elapsed_ms, 1),
+        **details,
+    }
+    peak = peak_rss_mib()
+    if peak is not None:
+        fields["peak_rss_mib"] = peak
+    app.logger.info(
+        "Processing timing %s",
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+    return elapsed_ms
 
 
 def is_api_request() -> bool:
@@ -188,9 +221,14 @@ def get_mongo_database():
 
 def validate_mongo_connection() -> None:
     """Validate MongoDB Atlas connectivity with a ping command."""
+    started = time.perf_counter()
     app.logger.debug("Validating MongoDB connection for database '%s'", DB_NAME)
     get_mongo_client().admin.command("ping")
-    app.logger.info("MongoDB connection validated for database '%s'", DB_NAME)
+    app.logger.info(
+        "MongoDB connection validated database=%s duration_ms=%.1f",
+        DB_NAME,
+        (time.perf_counter() - started) * 1000,
+    )
 
 
 def ensure_mongo_indexes() -> None:
@@ -199,6 +237,7 @@ def ensure_mongo_indexes() -> None:
     if _indexes_ready:
         return
 
+    started = time.perf_counter()
     validate_mongo_connection()
     database = get_mongo_database()
     database.processed_files.create_index(
@@ -235,7 +274,10 @@ def ensure_mongo_indexes() -> None:
         name="idx_gcm_genre_channels",
     )
     _indexes_ready = True
-    app.logger.info("MongoDB indexes are ready")
+    app.logger.info(
+        "MongoDB indexes are ready duration_ms=%.1f",
+        (time.perf_counter() - started) * 1000,
+    )
 
 
 def get_collections():
@@ -464,9 +506,11 @@ def build_filename(channel: str, date_str: str) -> str:
 
 def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
     """Run barc_nct_comparison.py and return (xlsx_bytes, output_filename, stats)."""
+    total_started = time.perf_counter()
     output_filename = "output.xlsx"
-    stats = {}
+    stats = {"timings_ms": {}, "input_bytes": len(file_bytes)}
 
+    metadata_started = time.perf_counter()
     try:
         df = pd.read_excel(io.BytesIO(file_bytes), dtype=str)
         source_series = df.get("source", pd.Series([""] * len(df)))
@@ -483,24 +527,56 @@ def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
             stats["nct_rows"] = int((normalized_source == "NCT").sum())
     except Exception as exc:
         stats["metadata_error"] = str(exc)
+    finally:
+        stats["timings_ms"]["metadata_read"] = round(
+            (time.perf_counter() - metadata_started) * 1000,
+            1,
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        setup_started = time.perf_counter()
         input_path = Path(tmpdir) / "brand_comparison_template.xlsx"
         input_path.write_bytes(file_bytes)
 
         temp_script = Path(tmpdir) / "barc_nct_comparison.py"
         shutil.copy(COMPARISON_SCRIPT, temp_script)
+        stats["timings_ms"]["temporary_setup"] = round(
+            (time.perf_counter() - setup_started) * 1000,
+            1,
+        )
         child_env = os.environ.copy()
         child_env["PYTHONIOENCODING"] = "utf-8"
-        app.logger.info("Comparison script started")
+        processor_started = time.perf_counter()
+        app.logger.info(
+            "Comparison script started input_bytes=%s original_name=%s",
+            len(file_bytes),
+            original_name,
+        )
         subprocess.run([sys.executable, str(temp_script)], cwd=tmpdir, env=child_env, check=True,timeout=120)
-        app.logger.info("Comparison script completed")
+        stats["timings_ms"]["comparison_processor"] = round(
+            (time.perf_counter() - processor_started) * 1000,
+            1,
+        )
+        app.logger.info(
+            "Comparison script completed duration_ms=%s",
+            stats["timings_ms"]["comparison_processor"],
+        )
         output_path = Path(tmpdir) / "barc_nct_comparison.xlsx"
         if not output_path.exists():
             raise FileNotFoundError("barc_nct_comparison.xlsx was not generated.")
 
+        output_read_started = time.perf_counter()
         xlsx_bytes = output_path.read_bytes()
+        stats["timings_ms"]["output_read"] = round(
+            (time.perf_counter() - output_read_started) * 1000,
+            1,
+        )
 
+    stats["output_bytes"] = len(xlsx_bytes)
+    stats["timings_ms"]["run_comparison_total"] = round(
+        (time.perf_counter() - total_started) * 1000,
+        1,
+    )
     return xlsx_bytes, output_filename, stats
 
 
@@ -510,16 +586,18 @@ def parse_workbook_sheets(
     channel_name: str,
     date_str: str,
     genre: str,
+    timing_stats: dict = None,
 ):
+    parse_started = time.perf_counter()
     uploaded_at = utc_now_iso()
     sheet_documents = []
-    xls = pd.ExcelFile(io.BytesIO(xlsx_bytes))
+    workbook = load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
 
-    for sheet_name in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str, header=None)
+    for worksheet in workbook.worksheets:
+        sheet_started = time.perf_counter()
         rows_data = []
-        for _, row in df.iterrows():
-            rows_data.append([str(value) if pd.notna(value) else "" for value in row])
+        for row in worksheet.iter_rows(values_only=True):
+            rows_data.append([str(value) if value is not None else "" for value in row])
 
         headers = rows_data[0] if rows_data else []
         sheet_documents.append(
@@ -528,7 +606,7 @@ def parse_workbook_sheets(
                 "channel_name": channel_name,
                 "genre": genre,
                 "date": date_str,
-                "sheet_name": sheet_name,
+                "sheet_name": worksheet.title,
                 "headers": headers,
                 "rows": rows_data,
                 "row_count": len(rows_data),
@@ -536,14 +614,47 @@ def parse_workbook_sheets(
                 "uploaded_at": uploaded_at,
             }
         )
+        app.logger.info(
+            "Workbook sheet parsed sheet=%s rows=%s columns=%s duration_ms=%.1f",
+            worksheet.title,
+            len(rows_data),
+            len(headers),
+            (time.perf_counter() - sheet_started) * 1000,
+        )
 
+    workbook.close()
+    if timing_stats is not None:
+        timing_stats["workbook_parse"] = round(
+            (time.perf_counter() - parse_started) * 1000,
+            1,
+        )
     return sheet_documents
 
 
-def upload_to_db(xlsx_bytes: bytes, channel_name: str, date_str: str, original_filename: str):
+def upload_to_db(
+    xlsx_bytes: bytes,
+    channel_name: str,
+    date_str: str,
+    original_filename: str,
+    timing_stats: dict = None,
+    request_id: str = "background",
+):
     """Parse the processed Excel workbook and store it in MongoDB."""
+    timings = timing_stats if timing_stats is not None else {}
+    total_started = time.perf_counter()
+    started = time.perf_counter()
     processed_files, sheets, _ = get_collections()
+    timings["mongo_connection_and_indexes"] = round(
+        (time.perf_counter() - started) * 1000,
+        1,
+    )
+
+    started = time.perf_counter()
     channel_record = ensure_channel_record(channel_name)
+    timings["mongo_channel_lookup"] = round(
+        (time.perf_counter() - started) * 1000,
+        1,
+    )
     channel_name = channel_record["channel_name"]
     genre = channel_record["genre"]
     file_id = str(uuid.uuid4())
@@ -554,6 +665,7 @@ def upload_to_db(xlsx_bytes: bytes, channel_name: str, date_str: str, original_f
         channel_name,
         date_str,
         genre,
+        timing_stats=timings,
     )
 
     file_document = {
@@ -566,13 +678,49 @@ def upload_to_db(xlsx_bytes: bytes, channel_name: str, date_str: str, original_f
         "uploaded_at": uploaded_at,
     }
 
-    lookup = {"channel_name": channel_name, "date": date_str}
-    sheets.delete_many(lookup)
-    processed_files.replace_one(lookup, file_document, upsert=True)
-    if sheet_documents:
-        sheets.insert_many(sheet_documents)
+    size_started = time.perf_counter()
+    file_document_bytes = len(BSON.encode(file_document))
+    sheet_document_sizes = [len(BSON.encode(document)) for document in sheet_documents]
+    timings["mongo_document_sizing"] = round(
+        (time.perf_counter() - size_started) * 1000,
+        1,
+    )
+    app.logger.info(
+        "MongoDB document sizes request_id=%s workbook_document_bytes=%s sheet_documents_bytes=%s max_sheet_document_bytes=%s",
+        request_id,
+        file_document_bytes,
+        sum(sheet_document_sizes),
+        max(sheet_document_sizes, default=0),
+    )
 
-    print(f"[MongoDB] Stored {len(sheet_documents)} sheets for {channel_name} / {date_str}")
+    lookup = {"channel_name": channel_name, "date": date_str}
+    started = time.perf_counter()
+    sheets.delete_many(lookup)
+    timings["mongo_delete_sheets"] = round((time.perf_counter() - started) * 1000, 1)
+
+    started = time.perf_counter()
+    processed_files.replace_one(lookup, file_document, upsert=True)
+    timings["mongo_store_workbook"] = round((time.perf_counter() - started) * 1000, 1)
+
+    if sheet_documents:
+        started = time.perf_counter()
+        sheets.insert_many(sheet_documents)
+        timings["mongo_insert_sheets"] = round((time.perf_counter() - started) * 1000, 1)
+    else:
+        timings["mongo_insert_sheets"] = 0.0
+
+    timings["mongo_storage_total"] = round(
+        (time.perf_counter() - total_started) * 1000,
+        1,
+    )
+    app.logger.info(
+        "MongoDB upload complete request_id=%s channel=%s date=%s sheet_count=%s timings_ms=%s",
+        request_id,
+        channel_name,
+        date_str,
+        len(sheet_documents),
+        timings,
+    )
     return file_id
 
 
@@ -1274,28 +1422,77 @@ def analyze():
 @app.route("/api/compare", methods=["POST"])
 def compare_report():
     """Upload a file, run comparison, store it, and return the result."""
+    request_id = uuid.uuid4().hex[:12]
+    request_started = time.perf_counter()
     uploaded_file = request.files.get("file")
     if not uploaded_file:
         return api_error("No file provided", 400)
 
     try:
+        stage_started = time.perf_counter()
         file_bytes = uploaded_file.read()
+        log_stage(
+            request_id,
+            "upload_received",
+            stage_started,
+            input_bytes=len(file_bytes),
+            filename=uploaded_file.filename,
+        )
+
+        stage_started = time.perf_counter()
+        if not file_bytes:
+            raise ValueError("Uploaded file is empty")
+        log_stage(request_id, "file_validation", stage_started)
+
         xlsx_bytes, output_filename, stats = run_comparison(file_bytes, uploaded_file.filename)
+        for stage, duration_ms in stats.get("timings_ms", {}).items():
+            app.logger.info(
+                "Processing timing request_id=%s stage=%s duration_ms=%s",
+                request_id,
+                stage,
+                duration_ms,
+            )
 
         channel = stats.get("channel", "UNKNOWN")
         date = stats.get("date", "00/00/0000")
+        mongo_timings = {}
         try:
-            upload_to_db(xlsx_bytes, channel, date, output_filename)
+            upload_to_db(
+                xlsx_bytes,
+                channel,
+                date,
+                output_filename,
+                timing_stats=mongo_timings,
+                request_id=request_id,
+            )
         except Exception as db_err:
             app.logger.exception("MongoDB upload failed: %s", db_err)
 
-        return send_file(
+        for stage, duration_ms in mongo_timings.items():
+            app.logger.info(
+                "Processing timing request_id=%s stage=%s duration_ms=%s",
+                request_id,
+                stage,
+                duration_ms,
+            )
+
+        response_started = time.perf_counter()
+        response = send_file(
             io.BytesIO(xlsx_bytes),
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             as_attachment=True,
             download_name=output_filename,
         )
+        log_stage(
+            request_id,
+            "response_generation",
+            response_started,
+            output_bytes=len(xlsx_bytes),
+        )
+        log_stage(request_id, "total", request_started)
+        return response
     except Exception as exc:
+        log_stage(request_id, "failed_total", request_started, error=type(exc).__name__)
         return api_error(str(exc), 500)
 
 
