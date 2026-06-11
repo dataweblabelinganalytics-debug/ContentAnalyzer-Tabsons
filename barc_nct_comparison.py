@@ -84,7 +84,7 @@ def log_timing(stage, started, **details):
 INPUT_FILE           = "brand_comparison_template.xlsx"
 OUTPUT_FILE          = "barc_nct_comparison.xlsx"
 SIMILARITY_THRESHOLD = 0.80
-TIME_TOLERANCE_SECS  = 1
+TIME_TOLERANCE_SECS  = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 INVALID_BRAND_NAMES = {"COMMERCIAL", "PROMO", "PROGRAM", "STORY BLOCK"}
