@@ -4,6 +4,7 @@ const API = '';
 const API_TIMEOUT_MS = 30000;
 const COMPARE_TIMEOUT_MS = 120000;
 const SESSION_STATE_KEY = 'contentAnalyzer.sessionState';
+const ACTIVE_COMPARE_JOB_KEY = 'contentAnalyzer.activeCompareJob';
 const TABLE_WIDTHS_KEY = 'contentAnalyzer.tableWidths';
 const KPI_STRIP_COLORS = {
   total: '#3B82F6',
@@ -34,6 +35,8 @@ let pieChart = null;
 let pieChartBarc = null;
 let pieChartTabsons = null;
 let syncedHoverIndex = null;
+let activeCompareJob = null;
+let comparePollTimer = null;
 
 function getSessionState() {
   try {
@@ -190,6 +193,7 @@ async function initApp() {
 
   await loadChannelDates();
   navigate(state.activeView || 'dashboard');
+  restoreActiveCompareJob();
 }
 
 // ── Navigation ────────────────────────────────────────────────────────────────
@@ -978,26 +982,147 @@ async function runCompare() {
   const input = document.getElementById('compare-file-input');
   const file = input.files[0];
   if (!file) { showToast('Please select a file','error'); return; }
+  const runButton = document.getElementById('compare-run-btn');
+  runButton.disabled = true;
   showLoading(true);
   try {
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetchBlobResponse(
+    const res = await safeFetch(
       API+'/api/compare',
       {method:'POST',body:fd},
       COMPARE_TIMEOUT_MS
     );
-    const blob = await res.blob();
-    let filename = 'comparison_result.xlsx';
-    const disp = res.headers.get('Content-Disposition');
-    if (disp) { const m = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disp); if(m) filename = m[1].replace(/['"]/g,''); }
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href=url; a.download=filename; a.click();
-    setTimeout(()=>URL.revokeObjectURL(url),60000);
-    showToast('Comparison complete! File downloaded.','success');
-    loadChannelDates();
+    const job = await readJsonResponse(res);
+    startCompareJob(job);
+    showToast('Upload complete. Processing started in the background.','success');
   } catch(e) { showToast('Error: '+e.message,'error'); }
   showLoading(false);
+  runButton.disabled = false;
+}
+
+function startCompareJob(job) {
+  activeCompareJob = job;
+  sessionStorage.setItem(ACTIVE_COMPARE_JOB_KEY, job.job_id);
+  renderCompareJob(job);
+  scheduleComparePoll(250);
+}
+
+function restoreActiveCompareJob() {
+  const jobId = sessionStorage.getItem(ACTIVE_COMPARE_JOB_KEY);
+  if (!jobId) return;
+  activeCompareJob = { job_id: jobId };
+  scheduleComparePoll(0);
+}
+
+function scheduleComparePoll(delay = 2000) {
+  if (comparePollTimer) clearTimeout(comparePollTimer);
+  comparePollTimer = setTimeout(pollCompareJob, delay);
+}
+
+async function pollCompareJob() {
+  if (!activeCompareJob?.job_id) return;
+  try {
+    const job = await fetchJson(`${API}/api/job-status/${encodeURIComponent(activeCompareJob.job_id)}`);
+    activeCompareJob = job;
+    renderCompareJob(job);
+    if (job.status === 'COMPLETED') {
+      showToast('Comparison completed. Your report is ready.','success');
+      await loadChannelDates();
+      return;
+    }
+    if (job.status === 'FAILED') {
+      showToast('Comparison failed: '+(job.error || 'Unknown processing error'),'error');
+      return;
+    }
+    scheduleComparePoll(2000);
+  } catch (e) {
+    console.warn('Unable to refresh comparison job', e);
+    scheduleComparePoll(5000);
+  }
+}
+
+function formatEta(seconds) {
+  if (seconds === null || seconds === undefined) return 'Estimating completion...';
+  if (seconds < 60) return `About ${Math.max(1, seconds)} seconds remaining`;
+  const minutes = Math.ceil(seconds / 60);
+  return `About ${minutes} minute${minutes === 1 ? '' : 's'} remaining`;
+}
+
+function renderCompareJob(job) {
+  const panel = document.getElementById('compare-job-panel');
+  if (!panel) return;
+  const progress = Math.max(0, Math.min(100, Number(job.progress_percentage ?? job.progress ?? 0)));
+  const status = String(job.status || 'QUEUED').toUpperCase();
+  panel.classList.add('show');
+  panel.classList.toggle('completed', status === 'COMPLETED');
+  panel.classList.toggle('failed', status === 'FAILED');
+  document.getElementById('compare-job-status').textContent =
+    status.charAt(0) + status.slice(1).toLowerCase();
+  document.getElementById('compare-job-step').textContent = job.current_step || 'Waiting for worker';
+  document.getElementById('compare-job-percentage').textContent = `${progress}%`;
+  document.getElementById('compare-job-progress').style.width = `${progress}%`;
+  document.getElementById('compare-job-id').textContent = `Job ${job.job_id}`;
+  document.getElementById('compare-job-eta').textContent =
+    status === 'COMPLETED' ? 'Completed' :
+    status === 'FAILED' ? 'Processing stopped' :
+    status === 'QUEUED' ? 'Waiting for an available worker' :
+    formatEta(job.estimated_seconds_remaining);
+
+  const error = document.getElementById('compare-job-error');
+  error.textContent = job.error || '';
+  error.classList.toggle('show', Boolean(job.error));
+
+  const actions = document.getElementById('compare-job-actions');
+  const completed = status === 'COMPLETED' && job.download_available;
+  const failed = status === 'FAILED';
+  actions.classList.toggle('show', completed || failed);
+  document.getElementById('compare-download-btn').style.display = completed ? 'inline-flex' : 'none';
+  document.getElementById('compare-dashboard-btn').style.display = completed ? 'inline-flex' : 'none';
+  document.getElementById('compare-open-btn').style.display = completed ? 'inline-flex' : 'none';
+  document.getElementById('compare-retry-btn').style.display =
+    failed && job.retry_available ? 'inline-flex' : 'none';
+}
+
+async function downloadCompletedJob() {
+  if (!activeCompareJob?.download_url) return;
+  try {
+    const res = await fetchBlobResponse(API + activeCompareJob.download_url);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = activeCompareJob.output_filename || 'comparison_result.xlsx';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) {
+    showToast('Download failed: '+e.message, 'error');
+  }
+}
+
+async function activateCompletedJobReport() {
+  if (!activeCompareJob?.channel || !activeCompareJob?.date) return false;
+  globalChannel = activeCompareJob.channel;
+  globalDate = activeCompareJob.date;
+  saveSessionState();
+  await loadChannelDates();
+  return true;
+}
+
+async function openCompletedJobView(view) {
+  if (await activateCompletedJobReport()) navigate(view);
+}
+
+async function retryCompareJob() {
+  if (!activeCompareJob?.retry_url) return;
+  try {
+    const res = await safeFetch(API + activeCompareJob.retry_url, {method:'POST'});
+    const job = await readJsonResponse(res);
+    startCompareJob(job);
+    showToast('Job queued for retry.','success');
+  } catch (e) {
+    showToast('Retry failed: '+e.message,'error');
+  }
 }
 
 async function downloadTemplate() {

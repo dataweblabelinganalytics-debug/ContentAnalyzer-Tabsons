@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 import pandas as pd
@@ -28,9 +28,10 @@ from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from gridfs import GridFSBucket, NoFile
 from openpyxl import load_workbook
 from werkzeug.exceptions import HTTPException
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.errors import InvalidURI, PyMongoError
 
 load_dotenv()
@@ -50,9 +51,17 @@ DEFAULT_CHANNEL_GENRE = (
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_FILE = BASE_DIR / "brand_comparison_template.xlsx"
 COMPARISON_SCRIPT = BASE_DIR / "barc_nct_comparison.py"
+JOB_STATUSES = ("QUEUED", "PROCESSING", "COMPLETED", "FAILED")
+JOB_UPLOAD_RETENTION_DAYS = int(os.getenv("JOB_UPLOAD_RETENTION_DAYS", "7"))
+JOB_LEASE_SECONDS = int(os.getenv("JOB_LEASE_SECONDS", "600"))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+COMPARISON_PROCESS_TIMEOUT_SECONDS = int(
+    os.getenv("COMPARISON_PROCESS_TIMEOUT_SECONDS", "1800")
+)
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 CORS(app)
 
 logging.basicConfig(
@@ -161,6 +170,10 @@ def api_error(message: str, status: int = 500, **extra):
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def iso_after(seconds: int = 0, days: int = 0) -> str:
+    return (datetime.utcnow() + timedelta(seconds=seconds, days=days)).isoformat()
 
 
 def normalize_channel_name(channel_name: str) -> str:
@@ -273,6 +286,23 @@ def ensure_mongo_indexes() -> None:
         [("genre", ASCENDING), ("status", ASCENDING), ("channel_name", ASCENDING)],
         name="idx_gcm_genre_channels",
     )
+    database.processing_jobs.create_index(
+        [("job_id", ASCENDING)],
+        name="idx_jobs_job_id",
+        unique=True,
+    )
+    database.processing_jobs.create_index(
+        [("status", ASCENDING), ("created_at", ASCENDING)],
+        name="idx_jobs_queue",
+    )
+    database.processing_jobs.create_index(
+        [("status", ASCENDING), ("lease_expires_at", ASCENDING)],
+        name="idx_jobs_recovery",
+    )
+    database.processing_jobs.create_index(
+        [("input_expires_at", ASCENDING)],
+        name="idx_jobs_cleanup",
+    )
     _indexes_ready = True
     app.logger.info(
         "MongoDB indexes are ready duration_ms=%.1f",
@@ -293,6 +323,16 @@ def get_collections():
 def get_channel_master_collection():
     ensure_mongo_indexes()
     return get_mongo_database().genre_channel_master
+
+
+def get_processing_jobs_collection():
+    ensure_mongo_indexes()
+    return get_mongo_database().processing_jobs
+
+
+def get_job_files_bucket():
+    ensure_mongo_indexes()
+    return GridFSBucket(get_mongo_database(), bucket_name="job_files")
 
 
 def ensure_channel_record(
@@ -504,11 +544,14 @@ def build_filename(channel: str, date_str: str) -> str:
     return f"{channel_clean}({date_clean}) barc_nct_comparison"
 
 
-def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
+def run_comparison(file_bytes: bytes, original_name: str, progress_callback=None) -> tuple:
     """Run barc_nct_comparison.py and return (xlsx_bytes, output_filename, stats)."""
     total_started = time.perf_counter()
     output_filename = "output.xlsx"
     stats = {"timings_ms": {}, "input_bytes": len(file_bytes)}
+
+    if progress_callback:
+        progress_callback(10, "Reading Workbook")
 
     metadata_started = time.perf_counter()
     try:
@@ -540,19 +583,63 @@ def run_comparison(file_bytes: bytes, original_name: str) -> tuple:
 
         temp_script = Path(tmpdir) / "barc_nct_comparison.py"
         shutil.copy(COMPARISON_SCRIPT, temp_script)
+        progress_path = Path(tmpdir) / "comparison_progress.json"
         stats["timings_ms"]["temporary_setup"] = round(
             (time.perf_counter() - setup_started) * 1000,
             1,
         )
         child_env = os.environ.copy()
         child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["COMPARISON_PROGRESS_FILE"] = str(progress_path)
         processor_started = time.perf_counter()
         app.logger.info(
             "Comparison script started input_bytes=%s original_name=%s",
             len(file_bytes),
             original_name,
         )
-        subprocess.run([sys.executable, str(temp_script)], cwd=tmpdir, env=child_env, check=True,timeout=120)
+        if progress_callback:
+            progress_callback(20, "Starting Comparison Engine")
+        process = subprocess.Popen(
+            [sys.executable, str(temp_script)],
+            cwd=tmpdir,
+            env=child_env,
+        )
+        deadline = time.monotonic() + COMPARISON_PROCESS_TIMEOUT_SECONDS
+        progress_offset = 0
+        last_progress = (20, "Starting Comparison Engine")
+        last_heartbeat = time.monotonic()
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(
+                    process.args,
+                    COMPARISON_PROCESS_TIMEOUT_SECONDS,
+                )
+
+            if progress_path.exists():
+                try:
+                    with progress_path.open("r", encoding="utf-8") as progress_file:
+                        progress_file.seek(progress_offset)
+                        for progress_line in progress_file:
+                            progress_data = json.loads(progress_line)
+                            last_progress = (
+                                int(progress_data["progress"]),
+                                str(progress_data["step"]),
+                            )
+                            if progress_callback:
+                                progress_callback(*last_progress)
+                        progress_offset = progress_file.tell()
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    app.logger.debug("Comparison progress file was not ready")
+
+            if progress_callback and time.monotonic() - last_heartbeat >= 15:
+                progress_callback(*last_progress)
+                last_heartbeat = time.monotonic()
+            time.sleep(0.25)
+
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, process.args)
         stats["timings_ms"]["comparison_processor"] = round(
             (time.perf_counter() - processor_started) * 1000,
             1,
@@ -722,6 +809,130 @@ def upload_to_db(
         timings,
     )
     return file_id
+
+
+def update_job_progress(job_id: str, progress: int, current_step: str, worker_id: str = None):
+    update = {
+        "progress_percentage": max(0, min(100, int(progress))),
+        "current_step": str(current_step),
+        "updated_at": utc_now_iso(),
+        "lease_expires_at": iso_after(seconds=JOB_LEASE_SECONDS),
+    }
+    query = {"job_id": job_id, "status": "PROCESSING"}
+    if worker_id:
+        query["worker_id"] = worker_id
+    get_processing_jobs_collection().update_one(query, {"$set": update})
+
+
+def read_job_file(file_id) -> bytes:
+    output = io.BytesIO()
+    get_job_files_bucket().download_to_stream(ObjectId(str(file_id)), output)
+    return output.getvalue()
+
+
+def job_status_payload(job: dict) -> dict:
+    progress = int(job.get("progress_percentage") or 0)
+    status = job.get("status", "FAILED")
+    estimated_seconds_remaining = None
+    started_at = job.get("started_at")
+    if status == "PROCESSING" and started_at and 0 < progress < 100:
+        try:
+            elapsed = (datetime.utcnow() - datetime.fromisoformat(started_at)).total_seconds()
+            estimated_seconds_remaining = max(
+                0,
+                int((elapsed / progress) * (100 - progress)),
+            )
+        except (TypeError, ValueError):
+            pass
+
+    download_available = status == "COMPLETED" and bool(job.get("result_file_id"))
+    retry_available = status == "FAILED" and bool(job.get("input_file_id"))
+    payload = {
+        "job_id": job.get("job_id"),
+        "status": status,
+        "progress": progress,
+        "progress_percentage": progress,
+        "current_step": job.get("current_step", ""),
+        "error": job.get("error_message"),
+        "error_message": job.get("error_message"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "estimated_seconds_remaining": estimated_seconds_remaining,
+        "download_available": download_available,
+        "retry_available": retry_available,
+        "attempt_count": int(job.get("attempt_count") or 0),
+        "original_filename": job.get("original_filename", ""),
+        "output_filename": job.get("output_filename", ""),
+        "channel": job.get("channel", ""),
+        "date": job.get("date", ""),
+        "report_file_id": job.get("report_file_id"),
+    }
+    if download_available:
+        payload["download_url"] = f"/api/jobs/{job['job_id']}/download"
+    if retry_available:
+        payload["retry_url"] = f"/api/jobs/{job['job_id']}/retry"
+    return payload
+
+
+def create_processing_job(uploaded_file) -> dict:
+    original_filename = Path(uploaded_file.filename or "upload.xlsx").name
+    extension = Path(original_filename).suffix.lower()
+    if extension not in {".xlsx", ".xls"}:
+        raise ValueError("Only .xlsx and .xls files are supported")
+
+    job_id = str(uuid.uuid4())
+    now = utc_now_iso()
+    bucket = get_job_files_bucket()
+    input_file_id = bucket.upload_from_stream(
+        original_filename,
+        uploaded_file.stream,
+        metadata={
+            "job_id": job_id,
+            "kind": "input",
+            "created_at": now,
+        },
+    )
+
+    file_metadata = get_mongo_database().job_files.files.find_one(
+        {"_id": input_file_id},
+        {"length": 1},
+    ) or {}
+    input_size = int(file_metadata.get("length") or 0)
+    if input_size <= 0:
+        bucket.delete(input_file_id)
+        raise ValueError("Uploaded file is empty")
+
+    job = {
+        "job_id": job_id,
+        "created_at": now,
+        "started_at": None,
+        "completed_at": None,
+        "updated_at": now,
+        "status": "QUEUED",
+        "progress_percentage": 0,
+        "current_step": "Waiting for worker",
+        "error_message": None,
+        "original_filename": original_filename,
+        "input_file_id": input_file_id,
+        "input_size_bytes": input_size,
+        "input_expires_at": iso_after(days=JOB_UPLOAD_RETENTION_DAYS),
+        "result_file_id": None,
+        "report_file_id": None,
+        "output_filename": None,
+        "channel": None,
+        "date": None,
+        "attempt_count": 0,
+        "worker_id": None,
+        "lease_expires_at": None,
+        "timings_ms": {},
+    }
+    try:
+        get_processing_jobs_collection().insert_one(job)
+    except Exception:
+        bucket.delete(input_file_id)
+        raise
+    return job
 
 
 def clean_num(val):
@@ -1421,79 +1632,129 @@ def analyze():
 
 @app.route("/api/compare", methods=["POST"])
 def compare_report():
-    """Upload a file, run comparison, store it, and return the result."""
-    request_id = uuid.uuid4().hex[:12]
-    request_started = time.perf_counter()
+    """Persist an upload as a durable processing job and return immediately."""
     uploaded_file = request.files.get("file")
     if not uploaded_file:
         return api_error("No file provided", 400)
 
     try:
-        stage_started = time.perf_counter()
-        file_bytes = uploaded_file.read()
-        log_stage(
-            request_id,
-            "upload_received",
-            stage_started,
-            input_bytes=len(file_bytes),
-            filename=uploaded_file.filename,
+        job = create_processing_job(uploaded_file)
+        payload = job_status_payload(job)
+        payload.update(
+            {
+                "success": True,
+                "status_url": f"/api/job-status/{job['job_id']}",
+            }
         )
+        return json_response(payload, 202)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
 
-        stage_started = time.perf_counter()
-        if not file_bytes:
-            raise ValueError("Uploaded file is empty")
-        log_stage(request_id, "file_validation", stage_started)
 
-        xlsx_bytes, output_filename, stats = run_comparison(file_bytes, uploaded_file.filename)
-        for stage, duration_ms in stats.get("timings_ms", {}).items():
-            app.logger.info(
-                "Processing timing request_id=%s stage=%s duration_ms=%s",
-                request_id,
-                stage,
-                duration_ms,
-            )
+@app.route("/api/job-status/<job_id>", methods=["GET"])
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def get_job_status(job_id):
+    try:
+        job = get_processing_jobs_collection().find_one({"job_id": job_id})
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+    if not job:
+        return api_error("Job not found", 404)
+    return json_response(job_status_payload(job))
 
-        channel = stats.get("channel", "UNKNOWN")
-        date = stats.get("date", "00/00/0000")
-        mongo_timings = {}
-        try:
-            upload_to_db(
-                xlsx_bytes,
-                channel,
-                date,
-                output_filename,
-                timing_stats=mongo_timings,
-                request_id=request_id,
-            )
-        except Exception as db_err:
-            app.logger.exception("MongoDB upload failed: %s", db_err)
 
-        for stage, duration_ms in mongo_timings.items():
-            app.logger.info(
-                "Processing timing request_id=%s stage=%s duration_ms=%s",
-                request_id,
-                stage,
-                duration_ms,
-            )
+@app.route("/api/jobs", methods=["GET"])
+def get_job_history():
+    try:
+        limit = min(max(int(request.args.get("limit", "20")), 1), 100)
+        jobs = get_processing_jobs_collection().find(
+            {},
+            {
+                "_id": 0,
+                "worker_id": 0,
+                "lease_expires_at": 0,
+            },
+        ).sort("created_at", -1).limit(limit)
+        return json_response([job_status_payload(job) for job in jobs])
+    except ValueError:
+        return api_error("limit must be an integer", 400)
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
 
-        response_started = time.perf_counter()
-        response = send_file(
-            io.BytesIO(xlsx_bytes),
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            as_attachment=True,
-            download_name=output_filename,
+
+@app.route("/api/jobs/<job_id>/retry", methods=["POST"])
+def retry_job(job_id):
+    try:
+        now = utc_now_iso()
+        job = get_processing_jobs_collection().find_one_and_update(
+            {
+                "job_id": job_id,
+                "status": "FAILED",
+                "input_file_id": {"$ne": None},
+            },
+            {
+                "$set": {
+                    "status": "QUEUED",
+                    "progress_percentage": 0,
+                    "current_step": "Waiting for worker",
+                    "error_message": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "updated_at": now,
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                },
+                "$unset": {
+                    "result_file_id": "",
+                    "result_size_bytes": "",
+                    "report_file_id": "",
+                    "output_filename": "",
+                    "channel": "",
+                    "date": "",
+                },
+            },
+            return_document=ReturnDocument.AFTER,
         )
-        log_stage(
-            request_id,
-            "response_generation",
-            response_started,
-            output_bytes=len(xlsx_bytes),
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+    if not job:
+        existing = get_processing_jobs_collection().find_one({"job_id": job_id})
+        if not existing:
+            return api_error("Job not found", 404)
+        return api_error("Job cannot be retried", 409)
+    return json_response(job_status_payload(job), 202)
+
+
+@app.route("/api/jobs/<job_id>/download", methods=["GET"])
+def download_job_result(job_id):
+    try:
+        job = get_processing_jobs_collection().find_one(
+            {"job_id": job_id},
+            {
+                "status": 1,
+                "result_file_id": 1,
+                "output_filename": 1,
+            },
         )
-        log_stage(request_id, "total", request_started)
-        return response
-    except Exception as exc:
-        log_stage(request_id, "failed_total", request_started, error=type(exc).__name__)
-        return api_error(str(exc), 500)
+        if not job:
+            return api_error("Job not found", 404)
+        if job.get("status") != "COMPLETED" or not job.get("result_file_id"):
+            return api_error("Download is not available", 409)
+        xlsx_data = read_job_file(job["result_file_id"])
+    except NoFile:
+        return api_error("Generated report is no longer available", 410)
+    except (PyMongoError, RuntimeError) as exc:
+        return database_error_response(exc)
+
+    return send_file(
+        io.BytesIO(xlsx_data),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=job.get("output_filename") or "comparison_result.xlsx",
+    )
 
 
 @app.route("/api/template", methods=["GET"])

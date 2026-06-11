@@ -20,3 +20,24 @@ services:
         generateValue: true
       - key: MONGO_URI
         sync: false
+  - type: worker
+    name: content-analyzer-worker
+    runtime: python
+    plan: standard
+    buildCommand: pip install -r requirements.txt
+    startCommand: python job_worker.py
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FLASK_ENV
+        value: production
+      - key: DB_NAME
+        value: content_analyzer
+      - key: DEFAULT_CHANNEL_GENRE
+        value: NEWS
+      - key: MONGO_URI
+        fromService:
+          name: content-analyzer
+          type: web
+          envVarKey: MONGO_URI

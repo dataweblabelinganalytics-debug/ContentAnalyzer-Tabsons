@@ -32,6 +32,7 @@ Sheets:
 """
 
 import os
+import json
 import re
 import sys
 import time
@@ -45,6 +46,15 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 SCRIPT_STARTED = time.perf_counter()
+PROGRESS_FILE = os.getenv("COMPARISON_PROGRESS_FILE", "")
+
+
+def publish_progress(progress, step):
+    if not PROGRESS_FILE:
+        return
+    with open(PROGRESS_FILE, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"progress": progress, "step": step}) + "\n")
+        handle.flush()
 
 
 def peak_rss_mib():
@@ -1373,6 +1383,7 @@ log_timing(
     rows=len(df),
     columns=len(df.columns),
 )
+publish_progress(25, "Analyzing BARC Data")
 df.columns = [c.strip() for c in df.columns]
 
 for col in ["source","channel name","TelecastDate","TelecastStartTime",
@@ -1409,6 +1420,7 @@ log_timing(
     barc_rows=len(df_barc),
     nct_rows=len(df_nct),
 )
+publish_progress(45, "Matching Records")
 
 ok_count = sum(1 for r in barc_remarks if r == "OK")
 print(f"  Results   : {len(barc_remarks)} BARC rows → {ok_count} OK, "
@@ -1420,6 +1432,7 @@ for b, v in sorted(ps_brand_nct_map.items()):
     print(f"    {b}: count={v['count']}  secs={v['secs']}")
 print(f"  Brands matched : {sum(1 for m in brand_matches if m['matched'])}/{len(barc_brands)}")
 def run_comparison():
+    publish_progress(65, "Generating Workbook")
     generation_started = time.perf_counter()
     wb = Workbook()
     wb.remove(wb.active)
@@ -1467,6 +1480,7 @@ def run_comparison():
         workbook_cells=sum(ws.max_row * ws.max_column for ws in wb.worksheets),
     )
     log_timing("workbook_generation_total", generation_started)
+    publish_progress(80, "Workbook Generated")
     print(f"\nOutput saved: {OUTPUT_FILE}")
     print(f"  DETAILED ANALYSIS rows written: {da_rows}")
     log_timing("processor_total", SCRIPT_STARTED)

@@ -249,6 +249,37 @@
               Download Template
             </button>
           </div>
+          <div id="compare-job-panel" class="job-panel" aria-live="polite">
+            <div class="job-panel-head">
+              <div>
+                <div id="compare-job-status" class="job-status">Queued</div>
+                <div id="compare-job-step" class="job-step">Waiting for worker</div>
+              </div>
+              <div id="compare-job-percentage" class="job-percentage">0%</div>
+            </div>
+            <div class="job-progress-track">
+              <div id="compare-job-progress" class="job-progress-bar" style="width:0%"></div>
+            </div>
+            <div class="job-meta">
+              <span id="compare-job-id"></span>
+              <span id="compare-job-eta"></span>
+            </div>
+            <div id="compare-job-error" class="job-error"></div>
+            <div id="compare-job-actions" class="job-actions">
+              <button class="btn-primary" id="compare-download-btn" onclick="downloadCompletedJob()">
+                Download Report
+              </button>
+              <button class="btn-secondary" id="compare-dashboard-btn" onclick="openCompletedJobView('dashboard')">
+                View Dashboard
+              </button>
+              <button class="btn-secondary" id="compare-open-btn" onclick="openCompletedJobView('commercial-comparison')">
+                Open Comparison
+              </button>
+              <button class="btn-secondary" id="compare-retry-btn" onclick="retryCompareJob()">
+                Retry
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
