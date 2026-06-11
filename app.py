@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import atexit
 import shutil
 import subprocess
 import sys
@@ -51,12 +52,17 @@ DEFAULT_CHANNEL_GENRE = (
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_FILE = BASE_DIR / "brand_comparison_template.xlsx"
 COMPARISON_SCRIPT = BASE_DIR / "barc_nct_comparison.py"
+JOB_WORKER_SCRIPT = BASE_DIR / "job_worker.py"
 JOB_STATUSES = ("QUEUED", "PROCESSING", "COMPLETED", "FAILED")
 JOB_UPLOAD_RETENTION_DAYS = int(os.getenv("JOB_UPLOAD_RETENTION_DAYS", "7"))
 JOB_LEASE_SECONDS = int(os.getenv("JOB_LEASE_SECONDS", "600"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 COMPARISON_PROCESS_TIMEOUT_SECONDS = int(
     os.getenv("COMPARISON_PROCESS_TIMEOUT_SECONDS", "1800")
+)
+ENABLE_EMBEDDED_JOB_WORKER = (
+    os.getenv("ENABLE_EMBEDDED_JOB_WORKER", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 
 app = Flask(__name__, static_folder=".", static_url_path="")
@@ -74,6 +80,7 @@ _mongo_client = None
 _mongo_db = None
 _indexes_ready = False
 _genre_alignment_ready = False
+_embedded_worker_process = None
 
 
 def peak_rss_mib():
@@ -1633,6 +1640,7 @@ def analyze():
 @app.route("/api/compare", methods=["POST"])
 def compare_report():
     """Persist an upload as a durable processing job and return immediately."""
+    start_embedded_job_worker()
     uploaded_file = request.files.get("file")
     if not uploaded_file:
         return api_error("No file provided", 400)
@@ -1656,6 +1664,7 @@ def compare_report():
 @app.route("/api/job-status/<job_id>", methods=["GET"])
 @app.route("/api/jobs/<job_id>", methods=["GET"])
 def get_job_status(job_id):
+    start_embedded_job_worker()
     try:
         job = get_processing_jobs_collection().find_one({"job_id": job_id})
     except (PyMongoError, RuntimeError) as exc:
@@ -1811,8 +1820,53 @@ def run_startup_diagnostics() -> None:
         app.logger.warning("MongoDB startup validation/index initialization deferred: %s", exc)
 
 
+def stop_embedded_job_worker() -> None:
+    global _embedded_worker_process
+    process = _embedded_worker_process
+    if process and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    _embedded_worker_process = None
+
+
+def start_embedded_job_worker() -> None:
+    """Start a separate queue consumer when Render has only a web service."""
+    global _embedded_worker_process
+    if os.getenv("JOB_WORKER_PROCESS"):
+        return
+    if not ENABLE_EMBEDDED_JOB_WORKER:
+        app.logger.info("Embedded job worker disabled; expecting a dedicated worker service")
+        return
+    if not MONGO_URI:
+        app.logger.warning("Embedded job worker not started because MONGO_URI is not set")
+        return
+    if not JOB_WORKER_SCRIPT.exists():
+        app.logger.error("Embedded job worker script is missing: %s", JOB_WORKER_SCRIPT)
+        return
+    if _embedded_worker_process and _embedded_worker_process.poll() is None:
+        return
+
+    worker_env = os.environ.copy()
+    worker_env["JOB_WORKER_PROCESS"] = "embedded"
+    _embedded_worker_process = subprocess.Popen(
+        [sys.executable, "-u", str(JOB_WORKER_SCRIPT)],
+        cwd=str(BASE_DIR),
+        env=worker_env,
+    )
+    app.logger.info(
+        "Embedded job worker started pid=%s script=%s",
+        _embedded_worker_process.pid,
+        JOB_WORKER_SCRIPT.name,
+    )
+
+
 install_route_guards()
 run_startup_diagnostics()
+start_embedded_job_worker()
+atexit.register(stop_embedded_job_worker)
 
 
 if __name__ == "__main__":

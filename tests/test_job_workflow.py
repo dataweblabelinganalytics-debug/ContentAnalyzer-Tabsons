@@ -60,6 +60,25 @@ class FakeBucket:
 
 
 class JobApiTests(unittest.TestCase):
+    def tearDown(self):
+        app._embedded_worker_process = None
+
+    def test_standalone_web_service_starts_worker_process(self):
+        process = SimpleNamespace(pid=1234, poll=lambda: None)
+        with (
+            patch.object(app, "MONGO_URI", "mongodb://example"),
+            patch.object(app, "ENABLE_EMBEDDED_JOB_WORKER", True),
+            patch.dict("os.environ", {}, clear=False),
+            patch.object(app.subprocess, "Popen", return_value=process) as popen,
+        ):
+            app._embedded_worker_process = None
+            app.start_embedded_job_worker()
+
+        self.assertIs(app._embedded_worker_process, process)
+        worker_env = popen.call_args.kwargs["env"]
+        self.assertEqual(worker_env["JOB_WORKER_PROCESS"], "embedded")
+        self.assertIn("job_worker.py", popen.call_args.args[0][-1])
+
     def test_compare_returns_job_immediately(self):
         job = queued_job()
         with patch.object(app, "create_processing_job", return_value=job):

@@ -17,6 +17,7 @@ from app import (
     JOB_LEASE_SECONDS,
     JOB_UPLOAD_RETENTION_DAYS,
     get_job_files_bucket,
+    validate_mongo_connection,
     get_mongo_database,
     get_processing_jobs_collection,
     iso_after,
@@ -268,7 +269,13 @@ def cleanup_expired_job_data():
 
 
 def run_worker():
-    logger.info("Worker starting worker_id=%s poll_seconds=%s", WORKER_ID, POLL_SECONDS)
+    logger.info(
+        "Worker starting worker_id=%s mode=%s poll_seconds=%s",
+        WORKER_ID,
+        os.getenv("JOB_WORKER_PROCESS", "dedicated"),
+        POLL_SECONDS,
+    )
+    validate_mongo_connection()
     recover_expired_jobs()
     next_cleanup = 0.0
 

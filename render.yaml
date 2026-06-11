@@ -36,6 +36,8 @@ services:
         value: content_analyzer
       - key: DEFAULT_CHANNEL_GENRE
         value: NEWS
+      - key: JOB_WORKER_PROCESS
+        value: dedicated
       - key: MONGO_URI
         fromService:
           name: content-analyzer
