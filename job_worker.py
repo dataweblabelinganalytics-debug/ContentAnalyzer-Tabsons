@@ -23,9 +23,14 @@ from app import (
     iso_after,
     read_job_file,
     run_comparison,
+    safe_audit,
+    safe_failure,
+    safe_processing_history,
     update_job_progress,
     upload_to_db,
     utc_now_iso,
+    validate_report_consistency,
+    workbook_metadata,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -63,6 +68,11 @@ def recover_expired_jobs():
     )
     if result.modified_count:
         logger.warning("Recovered %s abandoned processing jobs", result.modified_count)
+        safe_audit(
+            "PROCESSING_JOBS_RECOVERED",
+            "COMPLETED",
+            details={"recovered_job_count": result.modified_count},
+        )
 
 
 def claim_next_job():
@@ -103,11 +113,22 @@ def store_job_result(job_id, output_filename, xlsx_bytes):
 def process_job(job):
     job_id = job["job_id"]
     result_file_id = None
+    processing_started_at = job.get("started_at") or utc_now_iso()
+    processing_started = time.perf_counter()
     logger.info(
         "Processing job job_id=%s filename=%s attempt=%s",
         job_id,
         job.get("original_filename"),
         job.get("attempt_count"),
+    )
+    safe_audit(
+        "COMPARISON_START",
+        "PROCESSING",
+        job_id=job_id,
+        details={
+            "original_filename": job.get("original_filename"),
+            "attempt_count": job.get("attempt_count"),
+        },
     )
 
     def progress(progress_percentage, current_step):
@@ -125,6 +146,34 @@ def process_job(job):
             file_bytes,
             job.get("original_filename") or "upload.xlsx",
             progress_callback=progress,
+        )
+        try:
+            metadata = workbook_metadata(xlsx_bytes)
+        except Exception as metadata_exc:
+            metadata = {
+                "workbook_size_bytes": len(xlsx_bytes),
+                "sheet_count": 0,
+                "rows_processed": int(stats.get("barc_rows") or 0)
+                + int(stats.get("nct_rows") or 0),
+                "sheet_rows": {},
+                "checksum_sha256": "",
+            }
+            safe_failure(
+                metadata_exc,
+                job_id=job_id,
+                context={"operation": "workbook_metadata"},
+                category="WORKBOOK_EXCEPTION",
+            )
+        safe_audit(
+            "WORKBOOK_GENERATED",
+            "COMPLETED",
+            channel=stats.get("channel", ""),
+            date=stats.get("date", ""),
+            job_id=job_id,
+            details={
+                "output_filename": output_filename,
+                **metadata,
+            },
         )
 
         channel = stats.get("channel", "UNKNOWN")
@@ -174,6 +223,64 @@ def process_job(job):
         if completion_result.modified_count != 1:
             get_job_files_bucket().delete(result_file_id)
             raise RuntimeError("Job lease was lost before completion")
+        safe_processing_history(
+            job,
+            completed_at=completed_at,
+            processing_duration_ms=round(
+                (time.perf_counter() - processing_started) * 1000,
+                1,
+            ),
+            workbook_size_bytes=metadata["workbook_size_bytes"],
+            sheet_count=metadata["sheet_count"],
+            rows_processed=metadata["rows_processed"],
+            job_status="COMPLETED",
+            channel=channel,
+            date=date_str,
+            report_file_id=report_file_id,
+        )
+        safe_audit(
+            "COMPARISON_COMPLETE",
+            "COMPLETED",
+            channel=channel,
+            date=date_str,
+            job_id=job_id,
+            details={
+                "report_file_id": report_file_id,
+                "result_file_id": str(result_file_id),
+                "processing_duration_ms": round(
+                    (time.perf_counter() - processing_started) * 1000,
+                    1,
+                ),
+            },
+        )
+        try:
+            validation = validate_report_consistency(
+                get_mongo_database(),
+                channel,
+                date_str,
+                job_id=job_id,
+            )
+            get_processing_jobs_collection().update_one(
+                {"job_id": job_id},
+                {
+                    "$set": {
+                        "integrity_status": validation["status"],
+                        "validation_id": validation["validation_id"],
+                        "updated_at": utc_now_iso(),
+                    }
+                },
+            )
+        except Exception as validation_exc:
+            safe_failure(
+                validation_exc,
+                job_id=job_id,
+                context={
+                    "operation": "post_processing_validation",
+                    "channel": channel,
+                    "date": date_str,
+                },
+                category="VALIDATION_FAILURE",
+            )
         logger.info("Completed job job_id=%s report_file_id=%s", job_id, report_file_id)
     except Exception as exc:
         if result_file_id is not None:
@@ -196,6 +303,33 @@ def process_job(job):
                     "worker_id": None,
                     "lease_expires_at": None,
                 }
+            },
+        )
+        safe_processing_history(
+            job,
+            completed_at=failed_at,
+            processing_duration_ms=round(
+                (time.perf_counter() - processing_started) * 1000,
+                1,
+            ),
+            job_status="FAILED",
+            error_details=error_message,
+        )
+        safe_failure(
+            exc,
+            job_id=job_id,
+            context={
+                "operation": "comparison_processing",
+                "original_filename": job.get("original_filename"),
+            },
+        )
+        safe_audit(
+            "COMPARISON_FAILED",
+            "FAILED",
+            job_id=job_id,
+            details={
+                "original_filename": job.get("original_filename"),
+                "error": error_message,
             },
         )
         logger.error(
@@ -290,9 +424,15 @@ def run_worker():
             if job:
                 process_job(job)
                 continue
-        except PyMongoError:
+        except PyMongoError as exc:
+            safe_failure(
+                exc,
+                context={"operation": "worker_loop"},
+                category="MONGODB_EXCEPTION",
+            )
             logger.exception("MongoDB worker loop error")
-        except Exception:
+        except Exception as exc:
+            safe_failure(exc, context={"operation": "worker_loop"})
             logger.exception("Unexpected worker loop error")
         time.sleep(POLL_SECONDS)
 

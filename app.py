@@ -6,6 +6,7 @@ sheet retrieval, brand management, and report downloads.
 """
 
 import io
+import hmac
 import json
 import logging
 import os
@@ -32,8 +33,27 @@ from flask_cors import CORS
 from gridfs import GridFSBucket, NoFile
 from openpyxl import load_workbook
 from werkzeug.exceptions import HTTPException
-from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import InvalidURI, PyMongoError
+
+from audit_recovery import (
+    AUDIT_COLLECTION,
+    COMMERCIAL_AUDIT_COLLECTION,
+    FAILURE_COLLECTION,
+    HISTORY_COLLECTION,
+    VALIDATION_COLLECTION,
+    VERSION_COLLECTION,
+    create_report_version,
+    ensure_audit_indexes,
+    record_audit,
+    record_commercial_change,
+    record_failure,
+    record_processing_history,
+    restore_report_version,
+    validate_report_consistency,
+    version_summary,
+    workbook_metadata,
+)
 
 load_dotenv()
 
@@ -64,6 +84,7 @@ ENABLE_EMBEDDED_JOB_WORKER = (
     os.getenv("ENABLE_EMBEDDED_JOB_WORKER", "true").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
@@ -310,6 +331,7 @@ def ensure_mongo_indexes() -> None:
         [("input_expires_at", ASCENDING)],
         name="idx_jobs_cleanup",
     )
+    ensure_audit_indexes(database)
     _indexes_ready = True
     app.logger.info(
         "MongoDB indexes are ready duration_ms=%.1f",
@@ -340,6 +362,60 @@ def get_processing_jobs_collection():
 def get_job_files_bucket():
     ensure_mongo_indexes()
     return GridFSBucket(get_mongo_database(), bucket_name="job_files")
+
+
+def safe_audit(user_action, status, **kwargs):
+    """Record an audit event without breaking the primary user workflow."""
+    try:
+        return record_audit(
+            get_mongo_database(),
+            user_action,
+            status,
+            **kwargs,
+        )
+    except Exception as exc:
+        app.logger.warning("Audit event could not be stored action=%s error=%s", user_action, exc)
+        return None
+
+
+def safe_failure(exc, job_id="", context=None, category=None):
+    """Capture diagnostics when possible, including during database outages."""
+    try:
+        return record_failure(
+            get_mongo_database(),
+            exc,
+            job_id=job_id,
+            context=context,
+            category=category,
+        )
+    except Exception as diagnostic_exc:
+        app.logger.warning("Failure diagnostics could not be stored: %s", diagnostic_exc)
+        return None
+
+
+def safe_processing_history(job, **updates):
+    try:
+        return record_processing_history(
+            get_mongo_database(),
+            job,
+            **updates,
+        )
+    except Exception as exc:
+        app.logger.warning("Processing history could not be stored: %s", exc)
+        return None
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_API_KEY:
+            return api_error("Admin diagnostic API is not configured", 503)
+        supplied_key = request.headers.get("X-Admin-Key", "")
+        if not hmac.compare_digest(supplied_key, ADMIN_API_KEY):
+            return api_error("Unauthorized", 401)
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def ensure_channel_record(
@@ -414,7 +490,7 @@ def migrate_genre_hierarchy(force: bool = False):
     if _genre_alignment_ready and not force:
         return {"channels": 0, "processed_files": 0, "sheets": 0, "already_aligned": True}
 
-    processed_files, sheets, _ = get_collections()
+    processed_files, sheets, brand_modifications = get_collections()
     channel_names = [
         name for name in processed_files.distinct("channel_name")
         if normalize_channel_name(name)
@@ -463,6 +539,11 @@ def update_channel_assignment(channel_name: str, genre: str, status: str = "acti
 
 def database_error_response(exc):
     app.logger.exception("Database operation failed: %s", exc)
+    safe_failure(
+        exc,
+        context={"method": request.method, "path": request.path},
+        category="MONGODB_EXCEPTION",
+    )
     return api_error("Database operation failed", 500, details=str(exc))
 
 
@@ -506,6 +587,10 @@ def handle_exception(e):
     status = e.code if isinstance(e, HTTPException) else 500
     if status >= 500:
         app.logger.exception("Unhandled exception on %s %s: %s", request.method, request.path, e)
+        safe_failure(
+            e,
+            context={"method": request.method, "path": request.path},
+        )
     else:
         app.logger.warning("HTTP exception on %s %s: %s", request.method, request.path, e)
     return json_response({"success": False, "error": str(e)}, status)
@@ -770,6 +855,9 @@ def upload_to_db(
         "original_filename": original_filename,
         "xlsx_data": Binary(xlsx_bytes),
         "uploaded_at": uploaded_at,
+        "workbook_size_bytes": len(xlsx_bytes),
+        "sheet_count": len(sheet_documents),
+        "rows_processed": sum(document["row_count"] for document in sheet_documents),
     }
 
     size_started = time.perf_counter()
@@ -788,20 +876,77 @@ def upload_to_db(
     )
 
     lookup = {"channel_name": channel_name, "date": date_str}
-    started = time.perf_counter()
-    sheets.delete_many(lookup)
-    timings["mongo_delete_sheets"] = round((time.perf_counter() - started) * 1000, 1)
+    existing_report = processed_files.find_one(lookup)
+    existing_versions = get_mongo_database()[VERSION_COLLECTION].count_documents(
+        {"channel": channel_name, "date": date_str}
+    )
+    current_modifications = list(
+        brand_modifications.find(lookup, {"_id": 0}).sort("timestamp", ASCENDING)
+    )
+    if existing_report and not existing_versions:
+        create_report_version(
+            get_mongo_database(),
+            channel_name,
+            date_str,
+            workbook_bytes_from_document(existing_report),
+            existing_report.get("original_filename") or "report.xlsx",
+            existing_report.get("file_id") or str(uuid.uuid4()),
+            "LEGACY_ORIGINAL_REPORT",
+            modifications=current_modifications,
+            genre=existing_report.get("genre") or genre,
+        )
 
-    started = time.perf_counter()
-    processed_files.replace_one(lookup, file_document, upsert=True)
-    timings["mongo_store_workbook"] = round((time.perf_counter() - started) * 1000, 1)
+    version = create_report_version(
+        get_mongo_database(),
+        channel_name,
+        date_str,
+        xlsx_bytes,
+        original_filename,
+        file_id,
+        "ORIGINAL_REPORT" if not existing_report else "REPROCESSED_REPORT",
+        modifications=current_modifications,
+        job_id=request_id if request_id != "background" else "",
+        genre=genre,
+    )
+    file_document["active_version_number"] = version["version_number"]
+    backup_sheets = list(sheets.find(lookup))
 
-    if sheet_documents:
+    try:
         started = time.perf_counter()
-        sheets.insert_many(sheet_documents)
-        timings["mongo_insert_sheets"] = round((time.perf_counter() - started) * 1000, 1)
-    else:
-        timings["mongo_insert_sheets"] = 0.0
+        sheets.delete_many(lookup)
+        timings["mongo_delete_sheets"] = round(
+            (time.perf_counter() - started) * 1000,
+            1,
+        )
+
+        started = time.perf_counter()
+        processed_files.replace_one(lookup, file_document, upsert=True)
+        timings["mongo_store_workbook"] = round(
+            (time.perf_counter() - started) * 1000,
+            1,
+        )
+
+        if sheet_documents:
+            started = time.perf_counter()
+            sheets.insert_many(sheet_documents)
+            timings["mongo_insert_sheets"] = round(
+                (time.perf_counter() - started) * 1000,
+                1,
+            )
+        else:
+            timings["mongo_insert_sheets"] = 0.0
+    except Exception:
+        sheets.delete_many(lookup)
+        if existing_report:
+            processed_files.replace_one(lookup, existing_report, upsert=True)
+        else:
+            processed_files.delete_one(lookup)
+        if backup_sheets:
+            sheets.insert_many(backup_sheets)
+        get_mongo_database()[VERSION_COLLECTION].delete_one(
+            {"version_id": version["version_id"]}
+        )
+        raise
 
     timings["mongo_storage_total"] = round(
         (time.perf_counter() - total_started) * 1000,
@@ -814,6 +959,14 @@ def upload_to_db(
         date_str,
         len(sheet_documents),
         timings,
+    )
+    safe_audit(
+        "REPORT_VERSION_CREATED",
+        "COMPLETED",
+        channel=channel_name,
+        date=date_str,
+        job_id=request_id if request_id != "background" else "",
+        details=version_summary(version),
     )
     return file_id
 
@@ -874,6 +1027,9 @@ def job_status_payload(job: dict) -> dict:
         "channel": job.get("channel", ""),
         "date": job.get("date", ""),
         "report_file_id": job.get("report_file_id"),
+        "integrity_status": job.get("integrity_status"),
+        "validation_id": job.get("validation_id"),
+        "result_size_bytes": int(job.get("result_size_bytes") or 0),
     }
     if download_available:
         payload["download_url"] = f"/api/jobs/{job['job_id']}/download"
@@ -939,6 +1095,15 @@ def create_processing_job(uploaded_file) -> dict:
     except Exception:
         bucket.delete(input_file_id)
         raise
+    safe_audit(
+        "FILE_UPLOAD",
+        "QUEUED",
+        job_id=job_id,
+        details={
+            "original_filename": original_filename,
+            "input_size_bytes": input_size,
+        },
+    )
     return job
 
 
@@ -967,6 +1132,56 @@ def parse_count_cell(value) -> int:
 
 def workbook_bytes_from_document(document) -> bytes:
     return bytes(document.get("xlsx_data") or b"")
+
+
+def ensure_legacy_report_version(channel, date, processed_file, modifications):
+    versions = get_mongo_database()[VERSION_COLLECTION]
+    if versions.count_documents({"channel": channel, "date": date}):
+        return None
+    return create_report_version(
+        get_mongo_database(),
+        channel,
+        date,
+        workbook_bytes_from_document(processed_file),
+        processed_file.get("original_filename") or "report.xlsx",
+        processed_file.get("file_id") or str(uuid.uuid4()),
+        "LEGACY_ORIGINAL_REPORT",
+        modifications=modifications,
+        genre=processed_file.get("genre") or "",
+    )
+
+
+def create_commercial_report_version(channel, date, reason, modifications):
+    processed_files, _, _ = get_collections()
+    lookup = {"channel_name": channel, "date": date}
+    processed_file = processed_files.find_one(
+        lookup
+    )
+    if not processed_file:
+        raise LookupError("Report not found")
+    ensure_legacy_report_version(channel, date, processed_file, modifications)
+    version = create_report_version(
+        get_mongo_database(),
+        channel,
+        date,
+        workbook_bytes_from_document(processed_file),
+        processed_file.get("original_filename") or "report.xlsx",
+        processed_file.get("file_id") or str(uuid.uuid4()),
+        reason,
+        modifications=modifications,
+        genre=processed_file.get("genre") or "",
+    )
+    try:
+        processed_files.update_one(
+            lookup,
+            {"$set": {"active_version_number": version["version_number"]}},
+        )
+    except Exception:
+        get_mongo_database()[VERSION_COLLECTION].delete_one(
+            {"version_id": version["version_id"]}
+        )
+        raise
+    return version
 
 
 @app.route("/")
@@ -1219,6 +1434,13 @@ def get_dashboard():
             result["barc_promo_sponsor"] = get_val("BARC PROMO SPONSOR COUNT DURATION")
             result["barc_program"] = get_val("BARC PROGRAM DURATION")
 
+    safe_audit(
+        "DASHBOARD_ACCESS",
+        "COMPLETED",
+        channel=channel,
+        date=date,
+        details={"source": source, "data_type": data_type},
+    )
     return json_response(result)
 
 
@@ -1453,21 +1675,122 @@ def move_brand():
 
     if not channel or not date or not action or not brand_name:
         return api_error("Missing required fields", 400)
+    if action not in {"remove_from_matched", "merge_to_matched"}:
+        return api_error("Unsupported commercial action", 400)
+    if action == "merge_to_matched" and not target_barc_brand:
+        return api_error("target_barc_brand is required for merge", 400)
 
     try:
-        _, _, brand_modifications = get_collections()
-        brand_modifications.insert_one(
-            {
-                "channel_name": channel,
-                "date": date,
-                "action": action,
+        processed_files, _, brand_modifications = get_collections()
+        processed_file = processed_files.find_one(
+            {"channel_name": channel, "date": date}
+        )
+        if not processed_file:
+            return api_error("Report not found", 404)
+        previous_active_version = processed_file.get("active_version_number")
+
+        before_modifications = list(
+            brand_modifications.find(
+                {"channel_name": channel, "date": date},
+                {"_id": 0},
+            ).sort("timestamp", ASCENDING)
+        )
+        ensure_legacy_report_version(
+            channel,
+            date,
+            processed_file,
+            before_modifications,
+        )
+        modification = {
+            "channel_name": channel,
+            "date": date,
+            "action": action,
+            "brand_name": brand_name,
+            "target_barc_brand": target_barc_brand,
+            "timestamp": utc_now_iso(),
+        }
+        insert_result = brand_modifications.insert_one(modification)
+        modification.pop("_id", None)
+        after_modifications = before_modifications + [modification]
+        try:
+            version = create_commercial_report_version(
+                channel,
+                date,
+                "COMMERCIAL_UNMATCH"
+                if action == "remove_from_matched"
+                else "COMMERCIAL_MERGE",
+                after_modifications,
+            )
+        except Exception:
+            brand_modifications.delete_one({"_id": insert_result.inserted_id})
+            raise
+
+        operation_type = "UNMATCH" if action == "remove_from_matched" else "MERGE"
+        try:
+            record_commercial_change(
+                get_mongo_database(),
+                channel,
+                date,
+                operation_type,
+                "commercial_match_state",
+                {
+                    "brand_name": brand_name,
+                    "target_barc_brand": target_barc_brand,
+                    "modifications": before_modifications,
+                },
+                {
+                    "brand_name": brand_name,
+                    "target_barc_brand": target_barc_brand,
+                    "modifications": after_modifications,
+                    "version_number": version["version_number"],
+                },
+                action,
+            )
+        except Exception:
+            brand_modifications.delete_one({"_id": insert_result.inserted_id})
+            get_mongo_database()[VERSION_COLLECTION].delete_one(
+                {"version_id": version["version_id"]}
+            )
+            processed_files.update_one(
+                {"channel_name": channel, "date": date},
+                {"$set": {"active_version_number": previous_active_version}},
+            )
+            raise
+        primary_event = (
+            "COMMERCIAL_REMOVE"
+            if action == "remove_from_matched"
+            else "COMMERCIAL_MERGE"
+        )
+        safe_audit(
+            primary_event,
+            "COMPLETED",
+            channel=channel,
+            date=date,
+            details={
                 "brand_name": brand_name,
                 "target_barc_brand": target_barc_brand,
-                "timestamp": utc_now_iso(),
-            }
+                "version_number": version["version_number"],
+            },
+        )
+        safe_audit(
+            "COMMERCIAL_UNMATCH"
+            if action == "remove_from_matched"
+            else "COMMERCIAL_MATCH",
+            "COMPLETED",
+            channel=channel,
+            date=date,
+            details={"brand_name": brand_name},
         )
     except (PyMongoError, RuntimeError) as exc:
         return database_error_response(exc)
+    except LookupError as exc:
+        return api_error(str(exc), 404)
+    except Exception as exc:
+        safe_failure(
+            exc,
+            context={"channel": channel, "date": date, "action": action},
+        )
+        raise
 
     return json_response({"success": True, "message": f"Brand '{brand_name}' {action} successfully"})
 
@@ -1479,9 +1802,71 @@ def undo_modifications():
     channel = data.get("channel", "")
     date = data.get("date", "")
 
+    if not channel or not date:
+        return api_error("channel and date required", 400)
+
     try:
-        _, _, brand_modifications = get_collections()
-        brand_modifications.delete_many({"channel_name": channel, "date": date})
+        processed_files, _, brand_modifications = get_collections()
+        processed_file = processed_files.find_one(
+            {"channel_name": channel, "date": date}
+        )
+        if not processed_file:
+            return api_error("Report not found", 404)
+        previous_active_version = processed_file.get("active_version_number")
+        lookup = {"channel_name": channel, "date": date}
+        before_modifications = list(
+            brand_modifications.find(lookup, {"_id": 0}).sort("timestamp", ASCENDING)
+        )
+        ensure_legacy_report_version(
+            channel,
+            date,
+            processed_file,
+            before_modifications,
+        )
+        brand_modifications.delete_many(lookup)
+        try:
+            version = create_commercial_report_version(
+                channel,
+                date,
+                "COMMERCIAL_RESTORE",
+                [],
+            )
+        except Exception:
+            if before_modifications:
+                brand_modifications.insert_many(before_modifications)
+            raise
+        try:
+            record_commercial_change(
+                get_mongo_database(),
+                channel,
+                date,
+                "RESTORE",
+                "commercial_match_state",
+                {"modifications": before_modifications},
+                {"modifications": [], "version_number": version["version_number"]},
+                "undo_modifications",
+            )
+        except Exception:
+            if before_modifications:
+                brand_modifications.insert_many(before_modifications)
+            get_mongo_database()[VERSION_COLLECTION].delete_one(
+                {"version_id": version["version_id"]}
+            )
+            processed_files.update_one(
+                lookup,
+                {"$set": {"active_version_number": previous_active_version}},
+            )
+            raise
+        safe_audit(
+            "COMMERCIAL_RESTORE",
+            "COMPLETED",
+            channel=channel,
+            date=date,
+            details={
+                "restored_modification_count": len(before_modifications),
+                "version_number": version["version_number"],
+            },
+        )
     except (PyMongoError, RuntimeError) as exc:
         return database_error_response(exc)
 
@@ -1506,6 +1891,13 @@ def download_preprocessed():
     if not row:
         return api_error("File not found", 404)
 
+    safe_audit(
+        "WORKBOOK_DOWNLOADED",
+        "COMPLETED",
+        channel=channel,
+        date=date,
+        details={"report_type": "preprocessed"},
+    )
     return send_file(
         io.BytesIO(workbook_bytes_from_document(row)),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1573,6 +1965,16 @@ def download_updated():
         base, ext = os.path.splitext(filename)
         filename = f"{base}_UPDATED{ext}"
 
+    safe_audit(
+        "WORKBOOK_DOWNLOADED",
+        "COMPLETED",
+        channel=channel,
+        date=date,
+        details={
+            "report_type": "updated",
+            "modification_count": len(mods),
+        },
+    )
     return send_file(
         io.BytesIO(xlsx_data),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1592,14 +1994,50 @@ def analyze():
     errors = []
 
     for uploaded_file in files:
+        request_id = str(uuid.uuid4())
+        processing_started_at = utc_now_iso()
+        processing_started = time.perf_counter()
         try:
             file_bytes = uploaded_file.read()
+            safe_audit(
+                "FILE_UPLOAD",
+                "RECEIVED",
+                job_id=request_id,
+                details={
+                    "original_filename": uploaded_file.filename,
+                    "input_size_bytes": len(file_bytes),
+                    "processing_mode": "synchronous",
+                },
+            )
+            safe_audit(
+                "COMPARISON_START",
+                "PROCESSING",
+                job_id=request_id,
+                details={"original_filename": uploaded_file.filename},
+            )
             xlsx_bytes, output_filename, stats = run_comparison(file_bytes, uploaded_file.filename)
+            safe_audit(
+                "WORKBOOK_GENERATED",
+                "COMPLETED",
+                channel=stats.get("channel", ""),
+                date=stats.get("date", ""),
+                job_id=request_id,
+                details={
+                    "output_filename": output_filename,
+                    "workbook_size_bytes": len(xlsx_bytes),
+                },
+            )
 
             channel = stats.get("channel", "UNKNOWN")
             date = stats.get("date", "00/00/0000")
             try:
-                file_id = upload_to_db(xlsx_bytes, channel, date, output_filename)
+                file_id = upload_to_db(
+                    xlsx_bytes,
+                    channel,
+                    date,
+                    output_filename,
+                    request_id=request_id,
+                )
                 stats["uploaded_to_db"] = True
                 stats["file_id"] = file_id
             except Exception as db_err:
@@ -1608,11 +2046,79 @@ def analyze():
                 app.logger.exception("MongoDB upload failed: %s", db_err)
 
             results.append({"fname": output_filename, "data": xlsx_bytes, "stats": stats})
+            workbook_stats = workbook_metadata(xlsx_bytes)
+            safe_processing_history(
+                {
+                    "job_id": request_id,
+                    "created_at": processing_started_at,
+                    "started_at": processing_started_at,
+                    "original_filename": uploaded_file.filename,
+                },
+                completed_at=utc_now_iso(),
+                processing_duration_ms=round(
+                    (time.perf_counter() - processing_started) * 1000,
+                    1,
+                ),
+                workbook_size_bytes=workbook_stats["workbook_size_bytes"],
+                sheet_count=workbook_stats["sheet_count"],
+                rows_processed=workbook_stats["rows_processed"],
+                job_status="COMPLETED",
+                channel=channel,
+                date=date,
+                report_file_id=stats.get("file_id"),
+            )
+            safe_audit(
+                "COMPARISON_COMPLETE",
+                "COMPLETED",
+                channel=channel,
+                date=date,
+                job_id=request_id,
+                details={"output_filename": output_filename},
+            )
         except Exception as exc:
             errors.append({"file": uploaded_file.filename, "error": str(exc)})
+            safe_processing_history(
+                {
+                    "job_id": request_id,
+                    "created_at": processing_started_at,
+                    "started_at": processing_started_at,
+                    "original_filename": uploaded_file.filename,
+                },
+                completed_at=utc_now_iso(),
+                processing_duration_ms=round(
+                    (time.perf_counter() - processing_started) * 1000,
+                    1,
+                ),
+                job_status="FAILED",
+                error_details=f"{type(exc).__name__}: {exc}",
+            )
+            safe_failure(
+                exc,
+                job_id=request_id,
+                context={
+                    "operation": "synchronous_comparison",
+                    "original_filename": uploaded_file.filename,
+                },
+            )
+            safe_audit(
+                "COMPARISON_FAILED",
+                "FAILED",
+                job_id=request_id,
+                details={
+                    "original_filename": uploaded_file.filename,
+                    "error": str(exc),
+                },
+            )
 
     if len(files) == 1 and len(results) == 1:
         result = results[0]
+        safe_audit(
+            "WORKBOOK_DOWNLOADED",
+            "COMPLETED",
+            channel=result["stats"].get("channel", ""),
+            date=result["stats"].get("date", ""),
+            details={"report_type": "synchronous_result"},
+        )
         return send_file(
             io.BytesIO(result["data"]),
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1734,6 +2240,12 @@ def retry_job(job_id):
         if not existing:
             return api_error("Job not found", 404)
         return api_error("Job cannot be retried", 409)
+    safe_audit(
+        "COMPARISON_RETRY",
+        "QUEUED",
+        job_id=job_id,
+        details={"attempt_count": job.get("attempt_count", 0)},
+    )
     return json_response(job_status_payload(job), 202)
 
 
@@ -1746,6 +2258,8 @@ def download_job_result(job_id):
                 "status": 1,
                 "result_file_id": 1,
                 "output_filename": 1,
+                "channel": 1,
+                "date": 1,
             },
         )
         if not job:
@@ -1758,11 +2272,361 @@ def download_job_result(job_id):
     except (PyMongoError, RuntimeError) as exc:
         return database_error_response(exc)
 
+    safe_audit(
+        "WORKBOOK_DOWNLOADED",
+        "COMPLETED",
+        channel=job.get("channel", ""),
+        date=job.get("date", ""),
+        job_id=job_id,
+        details={"report_type": "job_result"},
+    )
     return send_file(
         io.BytesIO(xlsx_data),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name=job.get("output_filename") or "comparison_result.xlsx",
+    )
+
+
+def admin_limit(default=50, maximum=500):
+    return min(max(int(request.args.get("limit", str(default))), 1), maximum)
+
+
+@app.route("/api/admin/audit-logs", methods=["GET"])
+@admin_required
+def admin_audit_logs():
+    query = {}
+    for parameter, field in (
+        ("job_id", "job_id"),
+        ("channel", "channel"),
+        ("date", "date"),
+        ("action", "user_action"),
+        ("status", "status"),
+    ):
+        value = request.args.get(parameter, "")
+        if value:
+            query[field] = value
+    documents = (
+        get_mongo_database()[AUDIT_COLLECTION]
+        .find(query, {"_id": 0})
+        .sort("timestamp", DESCENDING)
+        .limit(admin_limit())
+    )
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/processing-history", methods=["GET"])
+@admin_required
+def admin_processing_history():
+    query = {}
+    status = request.args.get("status", "")
+    filename = request.args.get("filename", "")
+    job_id = request.args.get("job_id", "")
+    channel = request.args.get("channel", "")
+    date = request.args.get("date", "")
+    if status:
+        query["job_status"] = status.upper()
+    if filename:
+        query["original_filename"] = {"$regex": re.escape(filename), "$options": "i"}
+    if job_id:
+        query["job_id"] = job_id
+    if channel:
+        query["channel"] = channel
+    if date:
+        query["date"] = date
+    documents = (
+        get_mongo_database()[HISTORY_COLLECTION]
+        .find(query, {"_id": 0})
+        .sort("upload_time", DESCENDING)
+        .limit(admin_limit())
+    )
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/commercial-audit", methods=["GET"])
+@admin_required
+def admin_commercial_audit():
+    query = {}
+    channel = request.args.get("channel", "")
+    date = request.args.get("date", "")
+    operation = request.args.get("operation", "")
+    if channel:
+        query["channel"] = channel
+    if date:
+        query["date"] = date
+    if operation:
+        query["operation_type"] = operation.upper()
+    documents = (
+        get_mongo_database()[COMMERCIAL_AUDIT_COLLECTION]
+        .find(query, {"_id": 0})
+        .sort("timestamp", DESCENDING)
+        .limit(admin_limit())
+    )
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/failures", methods=["GET"])
+@admin_required
+def admin_failures():
+    query = {}
+    job_id = request.args.get("job_id", "")
+    category = request.args.get("category", "")
+    if job_id:
+        query["job_id"] = job_id
+    if category:
+        query["error_category"] = category
+    documents = (
+        get_mongo_database()[FAILURE_COLLECTION]
+        .find(query, {"_id": 0})
+        .sort("timestamp", DESCENDING)
+        .limit(admin_limit())
+    )
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/validation-failures", methods=["GET"])
+@admin_required
+def admin_validation_failures():
+    query = {"status": "FAILED"}
+    channel = request.args.get("channel", "")
+    date = request.args.get("date", "")
+    if channel:
+        query["channel"] = channel
+    if date:
+        query["date"] = date
+    documents = (
+        get_mongo_database()[VALIDATION_COLLECTION]
+        .find(query, {"_id": 0})
+        .sort("timestamp", DESCENDING)
+        .limit(admin_limit())
+    )
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/reports/versions", methods=["GET"])
+@admin_required
+def admin_report_versions():
+    channel = request.args.get("channel", "")
+    date = request.args.get("date", "")
+    if not channel or not date:
+        return api_error("channel and date required", 400)
+    documents = get_mongo_database()[VERSION_COLLECTION].find(
+        {"channel": channel, "date": date},
+        {"_id": 0, "xlsx_data": 0, "modifications_snapshot": 0},
+    ).sort("version_number", DESCENDING)
+    return json_response(list(documents))
+
+
+@app.route("/api/admin/reports/restore", methods=["POST"])
+@admin_required
+def admin_restore_report():
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", "")
+    date = data.get("date", "")
+    mode = str(data.get("mode") or "specific").lower()
+    if not channel or not date:
+        return api_error("channel and date required", 400)
+
+    versions = list(
+        get_mongo_database()[VERSION_COLLECTION]
+        .find(
+            {"channel": channel, "date": date},
+            {"version_number": 1},
+        )
+        .sort("version_number", ASCENDING)
+    )
+    if not versions:
+        return api_error("No report versions found", 404)
+
+    if mode == "original":
+        target_version = versions[0]["version_number"]
+    elif mode == "previous":
+        if len(versions) < 2:
+            return api_error("No previous version is available", 409)
+        target_version = versions[-2]["version_number"]
+    elif mode == "specific":
+        try:
+            target_version = int(data.get("version_number"))
+        except (TypeError, ValueError):
+            return api_error("version_number is required for specific restore", 400)
+    else:
+        return api_error("mode must be original, previous, or specific", 400)
+
+    try:
+        restored = restore_report_version(
+            get_mongo_database(),
+            channel,
+            date,
+            target_version,
+            parse_workbook_sheets,
+        )
+        validation = validate_report_consistency(
+            get_mongo_database(),
+            channel,
+            date,
+        )
+        safe_audit(
+            "REPORT_RESTORED",
+            "COMPLETED",
+            channel=channel,
+            date=date,
+            details={
+                "mode": mode,
+                "source_version": target_version,
+                "new_version": restored["version_number"],
+                "validation_status": validation["status"],
+            },
+        )
+        return json_response(
+            {
+                "success": True,
+                "restored_from_version": target_version,
+                "current_version": version_summary(restored),
+                "validation": {
+                    "validation_id": validation["validation_id"],
+                    "status": validation["status"],
+                    "failure_count": validation["failure_count"],
+                },
+            }
+        )
+    except LookupError as exc:
+        return api_error(str(exc), 404)
+    except Exception as exc:
+        safe_failure(
+            exc,
+            context={
+                "operation": "report_restore",
+                "channel": channel,
+                "date": date,
+                "target_version": target_version,
+            },
+        )
+        safe_audit(
+            "REPORT_RESTORED",
+            "FAILED",
+            channel=channel,
+            date=date,
+            details={"target_version": target_version, "error": str(exc)},
+        )
+        raise
+
+
+@app.route("/api/admin/consistency-check", methods=["POST"])
+@admin_required
+def admin_consistency_check():
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", "")
+    date = data.get("date", "")
+    database = get_mongo_database()
+    if channel and date:
+        reports = [{"channel_name": channel, "date": date}]
+    else:
+        limit = min(max(int(data.get("limit", 100)), 1), 500)
+        reports = list(
+            database.processed_files.find(
+                {},
+                {"_id": 0, "channel_name": 1, "date": 1},
+            ).limit(limit)
+        )
+
+    results = [
+        validate_report_consistency(
+            database,
+            report.get("channel_name", ""),
+            report.get("date", ""),
+        )
+        for report in reports
+    ]
+    return json_response(
+        {
+            "checked": len(results),
+            "passed": sum(result["status"] == "PASSED" for result in results),
+            "failed": sum(result["status"] == "FAILED" for result in results),
+            "results": [
+                {
+                    "validation_id": result["validation_id"],
+                    "channel": result["channel"],
+                    "date": result["date"],
+                    "status": result["status"],
+                    "failure_count": result["failure_count"],
+                }
+                for result in results
+            ],
+        }
+    )
+
+
+@app.route("/api/admin/health", methods=["GET"])
+@admin_required
+def admin_health_dashboard():
+    database = get_mongo_database()
+    mongo_status = "UP"
+    try:
+        get_mongo_client().admin.command("ping")
+    except Exception:
+        mongo_status = "DOWN"
+    if mongo_status == "DOWN":
+        return json_response(
+            {
+                "total_reports": None,
+                "failed_reports": None,
+                "pending_jobs": None,
+                "mongo_status": mongo_status,
+                "storage_usage_bytes": None,
+                "average_processing_time_ms": None,
+                "success_rate": None,
+            },
+            503,
+        )
+
+    total_reports = database.processed_files.count_documents({})
+    failed_reports = database.processing_jobs.count_documents({"status": "FAILED"})
+    pending_jobs = database.processing_jobs.count_documents(
+        {"status": {"$in": ["QUEUED", "PROCESSING"]}}
+    )
+    completed_jobs = database.processing_jobs.count_documents({"status": "COMPLETED"})
+    terminal_jobs = completed_jobs + failed_reports
+    duration_result = list(
+        database[HISTORY_COLLECTION].aggregate(
+            [
+                {"$match": {"processing_duration_ms": {"$type": "number"}}},
+                {
+                    "$group": {
+                        "_id": None,
+                        "average_ms": {"$avg": "$processing_duration_ms"},
+                    }
+                },
+            ]
+        )
+    )
+    try:
+        storage_usage_bytes = int(database.command("dbStats").get("storageSize") or 0)
+    except Exception:
+        storage_usage_bytes = sum(
+            int(document.get("workbook_size_bytes") or 0)
+            for document in database.processed_files.find(
+                {},
+                {"workbook_size_bytes": 1},
+            )
+        )
+
+    return json_response(
+        {
+            "total_reports": total_reports,
+            "failed_reports": failed_reports,
+            "pending_jobs": pending_jobs,
+            "mongo_status": mongo_status,
+            "storage_usage_bytes": storage_usage_bytes,
+            "average_processing_time_ms": round(
+                duration_result[0]["average_ms"],
+                1,
+            )
+            if duration_result
+            else 0,
+            "success_rate": round(completed_jobs * 100 / terminal_jobs, 2)
+            if terminal_jobs
+            else 0,
+        }
     )
 
 
